@@ -70,7 +70,12 @@ def score_order(order, durations, conflicts, prefs, n):
         a, b = list(pair)
         if a in order and b in order:
             g = elapsed_gap(order, a, b, durations)
-            s += 200 if g >= 3600 else -(3600 - g) / 30
+            # 凹関数(√)でギャップを評価する。
+            # 凹関数はジェンセンの不等式により、同じ合計ギャップでも
+            # 均等分散のほうが常に高スコアになる。
+            # 例: A-B=10分・B-C=60分 → スコア合計 281.7
+            #     A-B=35分・B-C=35分 → スコア合計 305.6 ← 均等ケースが勝つ
+            s += (min(g, 3600) / 3600) ** 0.5 * 200
     for i, name in enumerate(order):
         p = prefs.get(name)
         if p == "first" and i < n / 2: s += 5
@@ -157,8 +162,8 @@ WARN_FILL   = PatternFill("solid", start_color="FFF2CC")
 ALT_FILL    = PatternFill("solid", start_color="F3F3F3")
 THIN        = Side(style="thin", color="CCCCCC")
 
-HEADERS    = ["出演順","ブロック内番号","出演開始時間","チーム名","曲名","アーティスト名","再生時間","掛け持ちチーム"]
-COL_WIDTHS = [9, 13, 16, 18, 22, 18, 11, 22]
+BASE_HEADERS    = ["出演順","ブロック内番号","出演開始時間","チーム名","曲名","アーティスト名","再生時間"]
+BASE_COL_WIDTHS = [9, 13, 16, 18, 22, 18, 11]
 
 def bdr():
     return Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -169,8 +174,8 @@ def fmt_dur(sec):
     m, s = divmod(int(sec), 60)
     return "{}:{:02d}".format(m, s)
 
-def apply_hdr(ws, row_idx, fill, font):
-    for col, h in enumerate(HEADERS, 1):
+def apply_hdr(ws, row_idx, fill, font, headers):
+    for col, h in enumerate(headers, 1):
         c = ws.cell(row_idx, col)
         c.value = h; c.fill = fill; c.font = font
         c.alignment = Alignment(horizontal="center", vertical="center")
@@ -180,8 +185,19 @@ def write_setlist(ws, schedule, df, durations, violations):
     team_lookup = df.set_index("name").to_dict("index")
     viol_teams = {v["team_a"] for v in violations} | {v["team_b"] for v in violations}
 
+    # 掛け持ちチームの最大数を算出してヘッダーを動的に構築
+    max_shared = max((len(info.get("shared_teams", [])) for info in team_lookup.values()), default=0)
+    if max_shared == 0:
+        shared_headers = ["掛け持ちチーム"]
+        shared_widths  = [22]
+    else:
+        shared_headers = ["掛け持ちチーム{}".format(i+1) for i in range(max_shared)]
+        shared_widths  = [18] * max_shared
+    headers    = BASE_HEADERS + shared_headers
+    col_widths = BASE_COL_WIDTHS + shared_widths
+
     # Row 1: メインヘッダー
-    apply_hdr(ws, 1, HDR_FILL, HDR_FONT)
+    apply_hdr(ws, 1, HDR_FILL, HDR_FONT, headers)
 
     team_num = 0
     current_block = None
@@ -198,7 +214,7 @@ def write_setlist(ws, schedule, df, durations, violations):
             # Block 2 以降の先頭にブロックヘッダー行を挿入
             if block_idx >= 2:
                 apply_hdr(ws, ws.max_row + 1, BLKHDR_FILL,
-                          Font(color="FFFFFF", bold=True, name="Arial"))
+                          Font(color="FFFFFF", bold=True, name="Arial"), headers)
 
         team_num += 1
         block_team_num[block_idx] += 1
@@ -206,22 +222,26 @@ def write_setlist(ws, schedule, df, durations, violations):
         info = team_lookup.get(name, {})
         block_label = "{}-{}".format(block_idx, block_team_num[block_idx])
 
-        raw_shared = info.get("shared_teams_raw", "")
-        if not raw_shared or (isinstance(raw_shared, float) and math.isnan(raw_shared)):
-            raw_shared = ", ".join(info.get("shared_teams", []))
+        shared_list = info.get("shared_teams", [])
+        # 列数に合わせてパディング（掛け持ちなしなら空文字）
+        if max_shared == 0:
+            shared_cells = [""]
+        else:
+            shared_cells = shared_list + [""] * (max_shared - len(shared_list))
+
         row = [team_num, block_label, fmt_time(entry["start"]),
-               name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"]), raw_shared or ""]
+               name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"])] + shared_cells
         ws.append(row)
         ri = ws.max_row
         fill = WARN_FILL if name in viol_teams else (ALT_FILL if team_num % 2 == 0 else None)
-        for col in range(1, len(HEADERS) + 1):
+        for col in range(1, len(headers) + 1):
             c = ws.cell(ri, col)
             if fill: c.fill = fill
             c.font = Font(name="Arial", size=10)
             c.alignment = Alignment(horizontal="left" if col==4 else "center", vertical="center")
             c.border = bdr()
 
-    for i, w in enumerate(COL_WIDTHS, 1):
+    for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.row_dimensions[1].height = 18
 

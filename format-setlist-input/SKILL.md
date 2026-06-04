@@ -1,5 +1,5 @@
 ---
-name: dance-setlist-formatter
+name: format-setlist-input
 description: >
   ダンスイベントの申込CSVを dance-setlist スキル用の入力Excelに整形する。
   曲情報CSV（受付番号・曲名・アーティスト名）とチーム情報CSV（受付番号・チーム名・掛け持ち列群・希望時間帯）の
@@ -13,7 +13,7 @@ description: >
 ## 概要
 
 申込フォームから出力された2つのCSVファイルを結合・整形し、
-`dance-setlist` スキルが受け付ける5列Excelファイルを生成する。
+`create-setlist` スキルが受け付ける5列Excelファイルを生成する。
 
 ---
 
@@ -66,7 +66,7 @@ PYTHONIOENCODING=utf-8 python3 "<SKILL_DIR>/scripts/format_input.py" \
 
 - 生成したExcelファイルのパスを伝える
 - 結合できたチーム数・結合できなかった受付番号（片方のファイルにしかない）を報告する
-- 次のステップとして `dance-setlist` スキルへの入力を促す
+- 次のステップとして `create-setlist` スキルへの入力を促す
 
 ---
 
@@ -75,7 +75,7 @@ PYTHONIOENCODING=utf-8 python3 "<SKILL_DIR>/scripts/format_input.py" \
 1. **結合**: 受付番号をキーに2ファイルを inner join（両方に存在する行のみ）
 2. **掛け持ち統合**: 「掛け持ち」を含むすべての列の非空値をカンマ区切りで1列に統合
    - オーバーフロー列にすでにカンマ区切りで入っている場合もそのまま展開して統合
-3. **出力**: 5列の整形済みExcel（dance-setlist の入力フォーマット）
+3. **出力**: 5列の整形済みExcel（create-setlist の入力フォーマット）
 
 ---
 
