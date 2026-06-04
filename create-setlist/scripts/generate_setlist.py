@@ -162,8 +162,8 @@ WARN_FILL   = PatternFill("solid", start_color="FFF2CC")
 ALT_FILL    = PatternFill("solid", start_color="F3F3F3")
 THIN        = Side(style="thin", color="CCCCCC")
 
-BASE_HEADERS    = ["出演順","ブロック内番号","出演開始時間","チーム名","曲名","アーティスト名","再生時間"]
-BASE_COL_WIDTHS = [9, 13, 16, 18, 22, 18, 11]
+BASE_HEADERS    = ["出演順","ブロック内番号","出演開始時間","チーム名","曲名","アーティスト名","出演時間","入りはけ時間"]
+BASE_COL_WIDTHS = [9, 13, 16, 18, 22, 18, 11, 13]
 
 def bdr():
     return Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -230,7 +230,7 @@ def write_setlist(ws, schedule, df, durations, violations):
             shared_cells = shared_list + [""] * (max_shared - len(shared_list))
 
         row = [team_num, block_label, fmt_time(entry["start"]),
-               name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"])] + shared_cells
+               name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells
         ws.append(row)
         ri = ws.max_row
         fill = WARN_FILL if name in viol_teams else (ALT_FILL if team_num % 2 == 0 else None)
