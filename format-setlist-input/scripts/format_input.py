@@ -42,6 +42,25 @@ def find_col(df, candidates):
     return None
 
 
+def dedup_by_latest_timestamp(df, id_col, ts_col, label):
+    """受付番号が重複する行がある場合、タイムスタンプが最新の行を残す。
+    タイムスタンプが無い/解析できない行は最も古いものとして扱う
+    （同一受付番号内で全て解析不能な場合は、元のファイル内で最後に登場した行を残す）。
+    """
+    if ts_col is None or ts_col not in df.columns:
+        return df
+    dup_ids = df.loc[df.duplicated(subset=id_col, keep=False), id_col].unique()
+    if len(dup_ids) > 0:
+        print("[{}] 受付番号の重複を検出: {} 件 → タイムスタンプが新しい行を採用".format(label, len(dup_ids)))
+    df = df.copy()
+    df["_ts_parsed"] = pd.to_datetime(df[ts_col], errors="coerce")
+    # タイムスタンプ未解析(NaT)の行は最も古い扱いとし、先頭に寄せる。
+    # 全て未解析の同一受付番号内では、安定ソートにより元ファイルで最後に登場した行が残る。
+    df = df.sort_values("_ts_parsed", kind="stable", na_position="first")
+    df = df.drop_duplicates(subset=id_col, keep="last")
+    return df.drop(columns=["_ts_parsed"]).sort_index()
+
+
 def merge_shared_teams(row, shared_cols):
     """掛け持ち列群の値を収集してカンマ区切りの1文字列に統合する。"""
     teams = []
@@ -161,6 +180,8 @@ def main():
     p.add_argument("--col-pref",          default="希望時間帯")
     p.add_argument("--col-shared-prefix", default="掛け持ち",
                    help="掛け持ち列のプレフィックス（デフォルト: 掛け持ち）")
+    p.add_argument("--col-timestamp", default="タイムスタンプ",
+                   help="タイムスタンプ列の名前（デフォルト: タイムスタンプ）")
     args = p.parse_args()
 
     # --- Load ---
@@ -174,11 +195,17 @@ def main():
     artist_col = find_col(df_songs, [args.col_artist, "アーティスト名", "アーティスト", "歌手"])
     team_col   = find_col(df_teams, [args.col_team,   "チーム名", "チーム", "団体名"])
     pref_col   = find_col(df_teams, [args.col_pref,   "希望時間帯", "希望", "時間帯"])
+    ts_col_s   = find_col(df_songs, [args.col_timestamp, "タイムスタンプ", "Timestamp"])
+    ts_col_t   = find_col(df_teams, [args.col_timestamp, "タイムスタンプ", "Timestamp"])
 
     for name, val in [("受付番号(曲情報)", id_col_s), ("受付番号(チーム情報)", id_col_t),
                        ("曲名", song_col), ("アーティスト名", artist_col), ("チーム名", team_col)]:
         if val is None:
             sys.exit("[ERROR] 列が見つかりません: {}".format(name))
+
+    # --- 受付番号の重複行はタイムスタンプが新しい方を採用 ---
+    df_songs = dedup_by_latest_timestamp(df_songs, id_col_s, ts_col_s, "曲情報")
+    df_teams = dedup_by_latest_timestamp(df_teams, id_col_t, ts_col_t, "チーム情報")
 
     # --- Detect shared-team columns ---
     shared_cols = [col for col in df_teams.columns if args.col_shared_prefix in col]
