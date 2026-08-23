@@ -116,15 +116,16 @@ def round_up_15(dt):
     rem = dt.minute % 15
     return dt if rem == 0 else dt + timedelta(minutes=(15 - rem))
 
+MIN_BREAK_MINUTES = 10
+
 def calc_schedule(blocks, durations, start_time_str):
     current = datetime.strptime(start_time_str, "%H:%M")
     schedule = []
     for block_idx, block in enumerate(blocks):
         if block_idx > 0:
             break_start = current
-            break_end = round_up_15(break_start + timedelta(minutes=15))
-            if break_end < break_start + timedelta(minutes=15):
-                break_end += timedelta(minutes=15)
+            # 休憩は最低10分確保しつつ、次ブロックの開始は00/15/30/45分に切り上げる
+            break_end = round_up_15(break_start + timedelta(minutes=MIN_BREAK_MINUTES))
             schedule.append({"type":"break","block":block_idx+1,
                 "start":break_start,"end":break_end,
                 "duration_sec":int((break_end-break_start).total_seconds())})
@@ -152,6 +153,25 @@ def check_violations(ordered, durations, conflicts, schedule=None):
             if g < 3600:
                 out.append({"team_a":a,"team_b":b,"gap_sec":g,"gap_str":str(timedelta(seconds=g))})
     return out
+
+def build_remarks(ordered, prefs, violations):
+    """ルール違反があるチームの備考メッセージを組み立てる。"""
+    remarks = {name: [] for name in ordered}
+    for v in violations:
+        a, b, gap_str = v["team_a"], v["team_b"], v["gap_str"]
+        remarks[a].append("掛け持ち間隔不足: {}との間隔が{}（必要:1時間以上）".format(b, gap_str))
+        remarks[b].append("掛け持ち間隔不足: {}との間隔が{}（必要:1時間以上）".format(a, gap_str))
+    n = len(ordered)
+    for i, name in enumerate(ordered):
+        p = prefs.get(name)
+        if p is None:
+            continue
+        actual = "first" if i < n / 2 else "second"
+        if actual != p:
+            want = "前半" if p == "first" else "後半"
+            got = "前半" if actual == "first" else "後半"
+            remarks[name].append("希望時間帯未達: {}希望→{}に配置".format(want, got))
+    return remarks
 
 # ── Excel Output ─────────────────────────────────────────────────────────────
 
@@ -181,9 +201,9 @@ def apply_hdr(ws, row_idx, fill, font, headers):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = bdr()
 
-def write_setlist(ws, schedule, df, durations, violations):
+def write_setlist(ws, schedule, df, durations, remarks):
     team_lookup = df.set_index("name").to_dict("index")
-    viol_teams = {v["team_a"] for v in violations} | {v["team_b"] for v in violations}
+    viol_teams = {name for name, msgs in remarks.items() if msgs}
 
     # 掛け持ちチームの最大数を算出してヘッダーを動的に構築
     max_shared = max((len(info.get("shared_teams", [])) for info in team_lookup.values()), default=0)
@@ -193,8 +213,8 @@ def write_setlist(ws, schedule, df, durations, violations):
     else:
         shared_headers = ["掛け持ちチーム{}".format(i+1) for i in range(max_shared)]
         shared_widths  = [18] * max_shared
-    headers    = BASE_HEADERS + shared_headers
-    col_widths = BASE_COL_WIDTHS + shared_widths
+    headers    = BASE_HEADERS + shared_headers + ["備考"]
+    col_widths = BASE_COL_WIDTHS + shared_widths + [40]
 
     # Row 1: メインヘッダー
     apply_hdr(ws, 1, HDR_FILL, HDR_FONT, headers)
@@ -229,8 +249,9 @@ def write_setlist(ws, schedule, df, durations, violations):
         else:
             shared_cells = shared_list + [""] * (max_shared - len(shared_list))
 
+        remark_text = "; ".join(remarks.get(name, []))
         row = [team_num, block_label, fmt_time(entry["start"]),
-               name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells
+               name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells + [remark_text]
         ws.append(row)
         ri = ws.max_row
         fill = WARN_FILL if name in viol_teams else (ALT_FILL if team_num % 2 == 0 else None)
@@ -238,7 +259,7 @@ def write_setlist(ws, schedule, df, durations, violations):
             c = ws.cell(ri, col)
             if fill: c.fill = fill
             c.font = Font(name="Arial", size=10)
-            c.alignment = Alignment(horizontal="left" if col==4 else "center", vertical="center")
+            c.alignment = Alignment(horizontal="left" if col in (4, len(headers)) else "center", vertical="center")
             c.border = bdr()
 
     for i, w in enumerate(col_widths, 1):
@@ -328,10 +349,12 @@ def main():
     blocks = assign_blocks(ordered, n_blocks)
     schedule = calc_schedule(blocks, durations, args.start_time)
     violations = check_violations(ordered, durations, conflicts, schedule=schedule)
+    prefs = {t["name"]: pref_half(t.get("preferred_time")) for t in teams}
+    remarks = build_remarks(ordered, prefs, violations)
 
     wb = Workbook()
     ws1 = wb.active; ws1.title = "セットリスト"
-    write_setlist(ws1, schedule, df, durations, violations)
+    write_setlist(ws1, schedule, df, durations, remarks)
     if conflicts:
         ws2 = wb.create_sheet("掛け持ちチェック")
         write_check(ws2, ordered, durations, conflicts, schedule)
