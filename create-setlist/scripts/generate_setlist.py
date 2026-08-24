@@ -59,17 +59,36 @@ def build_conflicts(teams):
                 pairs.add(frozenset([t["name"], o]))
     return pairs
 
-def elapsed_gap(ordered, a, b, durations):
+def compute_block_boundaries(n, n_blocks):
+    """assign_blocks と同じ分割ルールで、休憩が入る位置（0-indexed、
+    その位置の直前で休憩が発生する）のリストを返す。"""
+    if n_blocks <= 1 or n <= 0:
+        return []
+    base, extra = divmod(n, n_blocks)
+    boundaries, idx = [], 0
+    for i in range(n_blocks - 1):
+        idx += base + (1 if i < extra else 0)
+        if idx >= n:
+            break
+        boundaries.append(idx)
+    return boundaries
+
+def elapsed_gap(ordered, a, b, durations, boundaries=(), break_sec=0):
     ia, ib = ordered.index(a), ordered.index(b)
     if ia > ib: ia, ib = ib, ia
-    return sum(durations.get(ordered[i], 0) + 30 for i in range(ia, ib))
+    gap = sum(durations.get(ordered[i], 0) + 30 for i in range(ia, ib))
+    # a-b の間にブロックの休憩が挟まる場合、その分の時間も間隔に加算する
+    # （休憩は最低10分は確保される前提で見積もる）
+    crossed = sum(1 for p in boundaries if ia < p <= ib)
+    return gap + crossed * break_sec
 
-def score_order(order, durations, conflicts, prefs, n):
+def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0):
     s = 0
+    boundaries = compute_block_boundaries(len(order), n_blocks)
     for pair in conflicts:
         a, b = list(pair)
         if a in order and b in order:
-            g = elapsed_gap(order, a, b, durations)
+            g = elapsed_gap(order, a, b, durations, boundaries, break_sec)
             # 凹関数(√)でギャップを評価する。
             # 凹関数はジェンセンの不等式により、同じ合計ギャップでも
             # 均等分散のほうが常に高スコアになる。
@@ -82,7 +101,7 @@ def score_order(order, durations, conflicts, prefs, n):
         elif p == "second" and i >= n / 2: s += 5
     return s
 
-def greedy_schedule(teams, durations, conflicts):
+def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0):
     names = [t["name"] for t in teams]
     prefs = {t["name"]: pref_half(t.get("preferred_time")) for t in teams}
     cc = {n: 0 for n in names}
@@ -94,7 +113,7 @@ def greedy_schedule(teams, durations, conflicts):
         best_pos, best_score = 0, -float("inf")
         for pos in range(len(ordered) + 1):
             cand = ordered[:pos] + [name] + ordered[pos:]
-            sc = score_order(cand, durations, conflicts, prefs, len(names))
+            sc = score_order(cand, durations, conflicts, prefs, len(names), n_blocks, break_sec)
             if sc > best_score: best_score, best_pos = sc, pos
         ordered.insert(best_pos, name)
     return ordered
@@ -345,7 +364,7 @@ def main():
 
     conflicts = build_conflicts(teams)
     n_blocks = args.n_blocks if args.n_blocks > 0 else (5 if len(teams) > 15 else 4)
-    ordered = greedy_schedule(teams, durations, conflicts)
+    ordered = greedy_schedule(teams, durations, conflicts, n_blocks=n_blocks, break_sec=MIN_BREAK_MINUTES * 60)
     blocks = assign_blocks(ordered, n_blocks)
     schedule = calc_schedule(blocks, durations, args.start_time)
     violations = check_violations(ordered, durations, conflicts, schedule=schedule)
