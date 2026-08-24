@@ -50,6 +50,25 @@ def pref_half(val):
     if not val or (isinstance(val, float) and math.isnan(val)): return None
     return "first" if "前半" in str(val) else ("second" if "後半" in str(val) else None)
 
+# 希望時間帯の種別:
+#   first/second = 前半/後半（従来どおり）
+#   early/late   = できるだけ早め/遅めがいい（連続的な希望）
+#   before/after = 指定時刻(HH:MM)より前/後に出演したい（"time"キーが必須）
+PREF_TYPES = ("first", "second", "early", "late", "before", "after")
+
+def normalize_pref(override, raw_val):
+    """--pref-overrides で渡された構造化データを優先し、なければ従来通り
+    希望時間帯列の生テキストから前半/後半を簡易判定する。"""
+    if isinstance(override, dict) and override.get("type") in PREF_TYPES:
+        t = override["type"]
+        if t in ("before", "after"):
+            if not override.get("time"):
+                return None
+            return {"type": t, "time": override["time"]}
+        return {"type": t}
+    half = pref_half(raw_val)
+    return {"type": half} if half else None
+
 def build_conflicts(teams):
     names = {t["name"] for t in teams}
     pairs = set()
@@ -110,8 +129,43 @@ def elapsed_gap(ordered, a, b, durations, boundaries=(), break_sec=0):
     crossed = sum(1 for p in boundaries if ia < p <= ib)
     return gap + crossed * break_sec
 
+def estimate_start_dt(order, i, durations, boundaries, break_sec, start_dt):
+    """出演順 order の position i にいるチームの、開始時刻の見積もりを返す。"""
+    if start_dt is None:
+        return None
+    cum = sum(durations.get(order[j], 0) + 30 for j in range(i))
+    cum += break_sec * sum(1 for p in boundaries if p <= i)
+    return start_dt + timedelta(seconds=cum)
+
+def pref_contribution(pref, i, n, order, durations, boundaries, break_sec, start_dt):
+    if not pref:
+        return 0
+    t = pref["type"]
+    if t == "first":
+        return PREF_WEIGHT if i < n / 2 else 0
+    if t == "second":
+        return PREF_WEIGHT if i >= n / 2 else 0
+    if t == "early":
+        # 出演順が早いほど高スコア（連続的な希望）
+        return PREF_WEIGHT * (1 - i / max(n - 1, 1))
+    if t == "late":
+        return PREF_WEIGHT * (i / max(n - 1, 1))
+    if t in ("before", "after"):
+        est = estimate_start_dt(order, i, durations, boundaries, break_sec, start_dt)
+        if est is None:
+            return 0
+        try:
+            deadline = datetime.strptime(pref["time"], "%H:%M").replace(
+                year=est.year, month=est.month, day=est.day)
+        except (ValueError, KeyError):
+            return 0
+        if t == "before":
+            return PREF_WEIGHT if est <= deadline else 0
+        return PREF_WEIGHT if est >= deadline else 0
+    return 0
+
 def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0,
-                 similarity_pairs=()):
+                 similarity_pairs=(), start_dt=None):
     s = 0
     boundaries = compute_block_boundaries(len(order), n_blocks)
     for pair in conflicts:
@@ -131,15 +185,15 @@ def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0,
                 gap = position_gap(order, a, b)
                 s += min(gap, MIN_SIMILARITY_GAP) / MIN_SIMILARITY_GAP * SIMILARITY_WEIGHT
     for i, name in enumerate(order):
-        p = prefs.get(name)
-        if p == "first" and i < n / 2: s += PREF_WEIGHT
-        elif p == "second" and i >= n / 2: s += PREF_WEIGHT
+        s += pref_contribution(prefs.get(name), i, n, order, durations, boundaries, break_sec, start_dt)
     return s
 
 def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
-                     song_pairs=frozenset(), artist_pairs=frozenset()):
+                     song_pairs=frozenset(), artist_pairs=frozenset(),
+                     pref_overrides=None, start_dt=None):
     names = [t["name"] for t in teams]
-    prefs = {t["name"]: pref_half(t.get("preferred_time")) for t in teams}
+    pref_overrides = pref_overrides or {}
+    prefs = {t["name"]: normalize_pref(pref_overrides.get(t["name"]), t.get("preferred_time")) for t in teams}
     similarity_pairs = (song_pairs, artist_pairs)
     # 処理順は制約の優先度を反映: 掛け持ちを重く、曲・アーティスト重複を軽く重み付け
     cc = {n: 0 for n in names}
@@ -155,7 +209,7 @@ def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
         for pos in range(len(ordered) + 1):
             cand = ordered[:pos] + [name] + ordered[pos:]
             sc = score_order(cand, durations, conflicts, prefs, len(names), n_blocks, break_sec,
-                              similarity_pairs)
+                              similarity_pairs, start_dt)
             if sc > best_score: best_score, best_pos = sc, pos
         ordered.insert(best_pos, name)
     return ordered
@@ -238,10 +292,15 @@ def check_similarity_violations(ordered, pairs):
                 out.append({"team_a":a,"team_b":b,"gap":gap})
     return out
 
-def build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations):
+def build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations, schedule=None):
     """文句なしにクリアしていないチームすべてに備考メッセージを組み立てる。
     severity: 'warn' = ルール違反（要対応）, 'note' = 目安未達だが許容範囲（参考情報）"""
     remarks = {name: [] for name in ordered}
+    actual_starts = {}
+    if schedule:
+        for e in schedule:
+            if e.get("type") == "team":
+                actual_starts[e["name"]] = e["start"]
 
     def add(name, text, severity):
         remarks[name].append((text, severity))
@@ -264,14 +323,35 @@ def build_remarks(ordered, prefs, violations, shared_notes, song_violations, art
         add(b, "アーティストの連続: {}との間が{}組（最低2組空け）".format(a, gap), "warn")
     n = len(ordered)
     for i, name in enumerate(ordered):
-        p = prefs.get(name)
-        if p is None:
+        pref = prefs.get(name)
+        if not pref:
             continue
-        actual = "first" if i < n / 2 else "second"
-        if actual != p:
-            want = "前半" if p == "first" else "後半"
-            got = "前半" if actual == "first" else "後半"
-            add(name, "希望時間帯未達: {}希望→{}に配置".format(want, got), "note")
+        t = pref["type"]
+        if t in ("first", "second"):
+            actual = "first" if i < n / 2 else "second"
+            if actual != t:
+                want = "前半" if t == "first" else "後半"
+                got = "前半" if actual == "first" else "後半"
+                add(name, "希望時間帯未達: {}希望→{}に配置".format(want, got), "note")
+        elif t == "early" and i >= n / 2:
+            add(name, "希望時間帯未達: できるだけ早め希望→出演順{}/{}（後半寄り）".format(i + 1, n), "note")
+        elif t == "late" and i < n / 2:
+            add(name, "希望時間帯未達: できるだけ遅め希望→出演順{}/{}（前半寄り）".format(i + 1, n), "note")
+        elif t in ("before", "after"):
+            actual_start = actual_starts.get(name)
+            if actual_start is None:
+                continue
+            try:
+                deadline = datetime.strptime(pref["time"], "%H:%M").replace(
+                    year=actual_start.year, month=actual_start.month, day=actual_start.day)
+            except (ValueError, KeyError):
+                continue
+            if t == "before" and actual_start > deadline:
+                add(name, "希望時間帯未達: {}までの出演希望→実際は{}開始".format(
+                    pref["time"], actual_start.strftime("%H:%M")), "note")
+            elif t == "after" and actual_start < deadline:
+                add(name, "希望時間帯未達: {}以降の出演希望→実際は{}開始".format(
+                    pref["time"], actual_start.strftime("%H:%M")), "note")
     return remarks
 
 # ── Excel Output ─────────────────────────────────────────────────────────────
@@ -438,6 +518,8 @@ def main():
     p.add_argument("--col-shared", default="掛け持ちチーム")
     p.add_argument("--col-pref",   default="希望時間帯")
     p.add_argument("--duration-overrides", default="")
+    p.add_argument("--pref-overrides", default="",
+                   help='希望時間帯の構造化上書き。例: \'{"TEAM_A":{"type":"early"},"TEAM_B":{"type":"before","time":"15:00"}}\'')
     args = p.parse_args()
 
     path = Path(args.input)
@@ -481,17 +563,21 @@ def main():
     conflicts = build_conflicts(teams)
     song_pairs = build_similarity_conflicts(teams, "song")
     artist_pairs = build_similarity_conflicts(teams, "artist")
+    pref_overrides = json.loads(args.pref_overrides) if args.pref_overrides else {}
     n_blocks = args.n_blocks if args.n_blocks > 0 else (5 if len(teams) > 15 else 4)
+    start_dt = datetime.strptime(args.start_time, "%H:%M")
     ordered = greedy_schedule(teams, durations, conflicts, n_blocks=n_blocks, break_sec=MIN_BREAK_MINUTES * 60,
-                               song_pairs=song_pairs, artist_pairs=artist_pairs)
+                               song_pairs=song_pairs, artist_pairs=artist_pairs,
+                               pref_overrides=pref_overrides, start_dt=start_dt)
     blocks = assign_blocks(ordered, n_blocks)
     schedule = calc_schedule(blocks, durations, args.start_time)
     violations = check_violations(ordered, durations, conflicts, schedule=schedule)
     shared_notes = check_shared_notes(ordered, durations, conflicts, schedule=schedule)
     song_violations = check_similarity_violations(ordered, song_pairs)
     artist_violations = check_similarity_violations(ordered, artist_pairs)
-    prefs = {t["name"]: pref_half(t.get("preferred_time")) for t in teams}
-    remarks = build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations)
+    prefs = {t["name"]: normalize_pref(pref_overrides.get(t["name"]), t.get("preferred_time")) for t in teams}
+    remarks = build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations,
+                             schedule=schedule)
 
     wb = Workbook()
     ws1 = wb.active; ws1.title = "セットリスト"
