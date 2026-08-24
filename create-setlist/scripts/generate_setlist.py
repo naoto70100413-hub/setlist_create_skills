@@ -206,13 +206,24 @@ def real_gap(schedule, a, b):
     return int((sb - ea).total_seconds()) if sa <= sb else int((sa - eb).total_seconds())
 
 def check_violations(ordered, durations, conflicts, schedule=None):
-    """掛け持ち間隔が最低ライン(40分)を下回っているペアを抽出する。"""
+    """掛け持ち間隔が最低ライン(40分)を下回っている(=違反)ペアを抽出する。"""
     out = []
     for pair in conflicts:
         a, b = list(pair)
         if a in ordered and b in ordered:
             g = real_gap(schedule, a, b) if schedule else elapsed_gap(ordered, a, b, durations)
             if g < MIN_SHARED_GAP_SEC:
+                out.append({"team_a":a,"team_b":b,"gap_sec":g,"gap_str":str(timedelta(seconds=g))})
+    return out
+
+def check_shared_notes(ordered, durations, conflicts, schedule=None):
+    """掛け持ち間隔は最低ライン(40分)は満たすが、目安(1時間)には届いていないペアを抽出する。"""
+    out = []
+    for pair in conflicts:
+        a, b = list(pair)
+        if a in ordered and b in ordered:
+            g = real_gap(schedule, a, b) if schedule else elapsed_gap(ordered, a, b, durations)
+            if MIN_SHARED_GAP_SEC <= g < IDEAL_SHARED_GAP_SEC:
                 out.append({"team_a":a,"team_b":b,"gap_sec":g,"gap_str":str(timedelta(seconds=g))})
     return out
 
@@ -227,21 +238,30 @@ def check_similarity_violations(ordered, pairs):
                 out.append({"team_a":a,"team_b":b,"gap":gap})
     return out
 
-def build_remarks(ordered, prefs, violations, song_violations, artist_violations):
-    """ルール違反があるチームの備考メッセージを組み立てる。"""
+def build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations):
+    """文句なしにクリアしていないチームすべてに備考メッセージを組み立てる。
+    severity: 'warn' = ルール違反（要対応）, 'note' = 目安未達だが許容範囲（参考情報）"""
     remarks = {name: [] for name in ordered}
+
+    def add(name, text, severity):
+        remarks[name].append((text, severity))
+
     for v in violations:
         a, b, gap_str = v["team_a"], v["team_b"], v["gap_str"]
-        remarks[a].append("掛け持ち間隔不足: {}との間隔が{}（目安:1時間、最低:40分）".format(b, gap_str))
-        remarks[b].append("掛け持ち間隔不足: {}との間隔が{}（目安:1時間、最低:40分）".format(a, gap_str))
+        add(a, "掛け持ち間隔不足: {}との間隔が{}（目安:1時間、最低:40分）".format(b, gap_str), "warn")
+        add(b, "掛け持ち間隔不足: {}との間隔が{}（目安:1時間、最低:40分）".format(a, gap_str), "warn")
+    for v in shared_notes:
+        a, b, gap_str = v["team_a"], v["team_b"], v["gap_str"]
+        add(a, "掛け持ち間隔が目安未達: {}との間隔が{}（最低40分は確保、目安1時間には未達）".format(b, gap_str), "note")
+        add(b, "掛け持ち間隔が目安未達: {}との間隔が{}（最低40分は確保、目安1時間には未達）".format(a, gap_str), "note")
     for v in song_violations:
         a, b, gap = v["team_a"], v["team_b"], v["gap"]
-        remarks[a].append("曲の連続: {}との間が{}組（最低2組空け）".format(b, gap))
-        remarks[b].append("曲の連続: {}との間が{}組（最低2組空け）".format(a, gap))
+        add(a, "曲の連続: {}との間が{}組（最低2組空け）".format(b, gap), "warn")
+        add(b, "曲の連続: {}との間が{}組（最低2組空け）".format(a, gap), "warn")
     for v in artist_violations:
         a, b, gap = v["team_a"], v["team_b"], v["gap"]
-        remarks[a].append("アーティストの連続: {}との間が{}組（最低2組空け）".format(b, gap))
-        remarks[b].append("アーティストの連続: {}との間が{}組（最低2組空け）".format(a, gap))
+        add(a, "アーティストの連続: {}との間が{}組（最低2組空け）".format(b, gap), "warn")
+        add(b, "アーティストの連続: {}との間が{}組（最低2組空け）".format(a, gap), "warn")
     n = len(ordered)
     for i, name in enumerate(ordered):
         p = prefs.get(name)
@@ -251,7 +271,7 @@ def build_remarks(ordered, prefs, violations, song_violations, artist_violations
         if actual != p:
             want = "前半" if p == "first" else "後半"
             got = "前半" if actual == "first" else "後半"
-            remarks[name].append("希望時間帯未達: {}希望→{}に配置".format(want, got))
+            add(name, "希望時間帯未達: {}希望→{}に配置".format(want, got), "note")
     return remarks
 
 # ── Excel Output ─────────────────────────────────────────────────────────────
@@ -260,6 +280,7 @@ HDR_FILL    = PatternFill("solid", start_color="1F3864")
 HDR_FONT    = Font(color="FFFFFF", bold=True, name="Arial")
 BLKHDR_FILL = PatternFill("solid", start_color="2E5FA3")
 WARN_FILL   = PatternFill("solid", start_color="FFF2CC")
+NOTE_FILL   = PatternFill("solid", start_color="E8F4FD")
 ALT_FILL    = PatternFill("solid", start_color="F3F3F3")
 THIN        = Side(style="thin", color="CCCCCC")
 
@@ -284,7 +305,9 @@ def apply_hdr(ws, row_idx, fill, font, headers):
 
 def write_setlist(ws, schedule, df, durations, remarks):
     team_lookup = df.set_index("name").to_dict("index")
-    viol_teams = {name for name, msgs in remarks.items() if msgs}
+    # 一つでも 'warn'（要対応の違反）があれば黄色、'note'（許容範囲の参考情報）のみなら水色で強調
+    warn_teams = {name for name, msgs in remarks.items() if any(sev == "warn" for _, sev in msgs)}
+    note_teams = {name for name, msgs in remarks.items() if msgs and name not in warn_teams}
 
     # 掛け持ちチームの最大数を算出してヘッダーを動的に構築
     max_shared = max((len(info.get("shared_teams", [])) for info in team_lookup.values()), default=0)
@@ -330,12 +353,14 @@ def write_setlist(ws, schedule, df, durations, remarks):
         else:
             shared_cells = shared_list + [""] * (max_shared - len(shared_list))
 
-        remark_text = "; ".join(remarks.get(name, []))
+        remark_text = "; ".join(text for text, _ in remarks.get(name, []))
         row = [team_num, block_label, fmt_time(entry["start"]),
                name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells + [remark_text]
         ws.append(row)
         ri = ws.max_row
-        fill = WARN_FILL if name in viol_teams else (ALT_FILL if team_num % 2 == 0 else None)
+        if name in warn_teams: fill = WARN_FILL
+        elif name in note_teams: fill = NOTE_FILL
+        else: fill = ALT_FILL if team_num % 2 == 0 else None
         for col in range(1, len(headers) + 1):
             c = ws.cell(ri, col)
             if fill: c.fill = fill
@@ -462,10 +487,11 @@ def main():
     blocks = assign_blocks(ordered, n_blocks)
     schedule = calc_schedule(blocks, durations, args.start_time)
     violations = check_violations(ordered, durations, conflicts, schedule=schedule)
+    shared_notes = check_shared_notes(ordered, durations, conflicts, schedule=schedule)
     song_violations = check_similarity_violations(ordered, song_pairs)
     artist_violations = check_similarity_violations(ordered, artist_pairs)
     prefs = {t["name"]: pref_half(t.get("preferred_time")) for t in teams}
-    remarks = build_remarks(ordered, prefs, violations, song_violations, artist_violations)
+    remarks = build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations)
 
     wb = Workbook()
     ws1 = wb.active; ws1.title = "セットリスト"
