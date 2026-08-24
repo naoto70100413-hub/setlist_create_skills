@@ -59,6 +59,26 @@ def build_conflicts(teams):
                 pairs.add(frozenset([t["name"], o]))
     return pairs
 
+def build_similarity_conflicts(teams, key):
+    """曲名/アーティスト名が同じチーム同士のペアを列挙する。"""
+    groups = {}
+    for t in teams:
+        val = str(t.get(key) or "").strip()
+        if not val:
+            continue
+        groups.setdefault(val, []).append(t["name"])
+    pairs = set()
+    for names in groups.values():
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                pairs.add(frozenset([names[i], names[j]]))
+    return pairs
+
+def position_gap(order, a, b):
+    """a と b の間に挟まるチーム数を返す。"""
+    ia, ib = order.index(a), order.index(b)
+    return abs(ib - ia) - 1
+
 def compute_block_boundaries(n, n_blocks):
     """assign_blocks と同じ分割ルールで、休憩が入る位置（0-indexed、
     その位置の直前で休憩が発生する）のリストを返す。"""
@@ -73,6 +93,14 @@ def compute_block_boundaries(n, n_blocks):
         boundaries.append(idx)
     return boundaries
 
+# 優先度順: 1. 掛け持ち間隔 > 2. 曲・アーティストの連続回避 > 3. 希望時間帯
+IDEAL_SHARED_GAP_SEC = 3600   # 基本目標: 1時間
+MIN_SHARED_GAP_SEC   = 2400   # 最低ライン: 40分
+SHARED_WEIGHT         = 200
+MIN_SIMILARITY_GAP    = 2     # 曲・アーティストは最低2組空ける
+SIMILARITY_WEIGHT     = 40
+PREF_WEIGHT           = 5
+
 def elapsed_gap(ordered, a, b, durations, boundaries=(), break_sec=0):
     ia, ib = ordered.index(a), ordered.index(b)
     if ia > ib: ia, ib = ib, ia
@@ -82,7 +110,8 @@ def elapsed_gap(ordered, a, b, durations, boundaries=(), break_sec=0):
     crossed = sum(1 for p in boundaries if ia < p <= ib)
     return gap + crossed * break_sec
 
-def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0):
+def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0,
+                 similarity_pairs=()):
     s = 0
     boundaries = compute_block_boundaries(len(order), n_blocks)
     for pair in conflicts:
@@ -94,26 +123,39 @@ def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0):
             # 均等分散のほうが常に高スコアになる。
             # 例: A-B=10分・B-C=60分 → スコア合計 281.7
             #     A-B=35分・B-C=35分 → スコア合計 305.6 ← 均等ケースが勝つ
-            s += (min(g, 3600) / 3600) ** 0.5 * 200
+            s += (min(g, IDEAL_SHARED_GAP_SEC) / IDEAL_SHARED_GAP_SEC) ** 0.5 * SHARED_WEIGHT
+    for pairs in similarity_pairs:
+        for pair in pairs:
+            a, b = list(pair)
+            if a in order and b in order:
+                gap = position_gap(order, a, b)
+                s += min(gap, MIN_SIMILARITY_GAP) / MIN_SIMILARITY_GAP * SIMILARITY_WEIGHT
     for i, name in enumerate(order):
         p = prefs.get(name)
-        if p == "first" and i < n / 2: s += 5
-        elif p == "second" and i >= n / 2: s += 5
+        if p == "first" and i < n / 2: s += PREF_WEIGHT
+        elif p == "second" and i >= n / 2: s += PREF_WEIGHT
     return s
 
-def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0):
+def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
+                     song_pairs=frozenset(), artist_pairs=frozenset()):
     names = [t["name"] for t in teams]
     prefs = {t["name"]: pref_half(t.get("preferred_time")) for t in teams}
+    similarity_pairs = (song_pairs, artist_pairs)
+    # 処理順は制約の優先度を反映: 掛け持ちを重く、曲・アーティスト重複を軽く重み付け
     cc = {n: 0 for n in names}
     for pair in conflicts:
-        for n in pair: cc[n] += 1
+        for n in pair: cc[n] += 3
+    for pairs in similarity_pairs:
+        for pair in pairs:
+            for n in pair: cc[n] += 1
     remaining = sorted(names, key=lambda x: -cc[x])
     ordered = []
     for name in remaining:
         best_pos, best_score = 0, -float("inf")
         for pos in range(len(ordered) + 1):
             cand = ordered[:pos] + [name] + ordered[pos:]
-            sc = score_order(cand, durations, conflicts, prefs, len(names), n_blocks, break_sec)
+            sc = score_order(cand, durations, conflicts, prefs, len(names), n_blocks, break_sec,
+                              similarity_pairs)
             if sc > best_score: best_score, best_pos = sc, pos
         ordered.insert(best_pos, name)
     return ordered
@@ -164,22 +206,42 @@ def real_gap(schedule, a, b):
     return int((sb - ea).total_seconds()) if sa <= sb else int((sa - eb).total_seconds())
 
 def check_violations(ordered, durations, conflicts, schedule=None):
+    """掛け持ち間隔が最低ライン(40分)を下回っているペアを抽出する。"""
     out = []
     for pair in conflicts:
         a, b = list(pair)
         if a in ordered and b in ordered:
             g = real_gap(schedule, a, b) if schedule else elapsed_gap(ordered, a, b, durations)
-            if g < 3600:
+            if g < MIN_SHARED_GAP_SEC:
                 out.append({"team_a":a,"team_b":b,"gap_sec":g,"gap_str":str(timedelta(seconds=g))})
     return out
 
-def build_remarks(ordered, prefs, violations):
+def check_similarity_violations(ordered, pairs):
+    """曲/アーティストが同じチーム同士が2組未満しか空いていないペアを抽出する。"""
+    out = []
+    for pair in pairs:
+        a, b = list(pair)
+        if a in ordered and b in ordered:
+            gap = position_gap(ordered, a, b)
+            if gap < MIN_SIMILARITY_GAP:
+                out.append({"team_a":a,"team_b":b,"gap":gap})
+    return out
+
+def build_remarks(ordered, prefs, violations, song_violations, artist_violations):
     """ルール違反があるチームの備考メッセージを組み立てる。"""
     remarks = {name: [] for name in ordered}
     for v in violations:
         a, b, gap_str = v["team_a"], v["team_b"], v["gap_str"]
-        remarks[a].append("掛け持ち間隔不足: {}との間隔が{}（必要:1時間以上）".format(b, gap_str))
-        remarks[b].append("掛け持ち間隔不足: {}との間隔が{}（必要:1時間以上）".format(a, gap_str))
+        remarks[a].append("掛け持ち間隔不足: {}との間隔が{}（目安:1時間、最低:40分）".format(b, gap_str))
+        remarks[b].append("掛け持ち間隔不足: {}との間隔が{}（目安:1時間、最低:40分）".format(a, gap_str))
+    for v in song_violations:
+        a, b, gap = v["team_a"], v["team_b"], v["gap"]
+        remarks[a].append("曲の連続: {}との間が{}組（最低2組空け）".format(b, gap))
+        remarks[b].append("曲の連続: {}との間が{}組（最低2組空け）".format(a, gap))
+    for v in artist_violations:
+        a, b, gap = v["team_a"], v["team_b"], v["gap"]
+        remarks[a].append("アーティストの連続: {}との間が{}組（最低2組空け）".format(b, gap))
+        remarks[b].append("アーティストの連続: {}との間が{}組（最低2組空け）".format(a, gap))
     n = len(ordered)
     for i, name in enumerate(ordered):
         p = prefs.get(name)
@@ -286,7 +348,7 @@ def write_setlist(ws, schedule, df, durations, remarks):
     ws.row_dimensions[1].height = 18
 
 def write_check(ws, ordered, durations, conflicts, schedule):
-    hdrs = ["チームA","チームB","実際の間隔","必要間隔","判定"]
+    hdrs = ["チームA","チームB","実際の間隔","目安/最低","判定"]
     ws.append(hdrs)
     for col in range(1, len(hdrs)+1):
         c = ws.cell(1, col)
@@ -296,17 +358,46 @@ def write_check(ws, ordered, durations, conflicts, schedule):
         a, b = list(pair)
         if a in ordered and b in ordered:
             g = real_gap(schedule, a, b)
-            ok = g >= 3600
-            row = [a, b, str(timedelta(seconds=g)), "1時間以上", "OK" if ok else "要確認"]
+            if g >= IDEAL_SHARED_GAP_SEC:
+                judge = "OK"
+            elif g >= MIN_SHARED_GAP_SEC:
+                judge = "許容(40分以上)"
+            else:
+                judge = "要確認"
+            row = [a, b, str(timedelta(seconds=g)), "1時間 / 40分", judge]
             ws.append(row)
             ri = ws.max_row
             for col in range(1, len(hdrs)+1):
                 c = ws.cell(ri, col)
-                if not ok: c.fill = WARN_FILL
+                if judge == "要確認": c.fill = WARN_FILL
                 c.font = Font(name="Arial", size=10)
                 c.alignment = Alignment(horizontal="center"); c.border = bdr()
     for i in range(1, len(hdrs)+1):
-        ws.column_dimensions[get_column_letter(i)].width = 16
+        ws.column_dimensions[get_column_letter(i)].width = 18
+
+def write_similarity_check(ws, ordered, song_pairs, artist_pairs):
+    hdrs = ["種別","チームA","チームB","間に挟まる組数","判定"]
+    ws.append(hdrs)
+    for col in range(1, len(hdrs)+1):
+        c = ws.cell(1, col)
+        c.fill = HDR_FILL; c.font = HDR_FONT
+        c.alignment = Alignment(horizontal="center"); c.border = bdr()
+    for label, pairs in (("曲", song_pairs), ("アーティスト", artist_pairs)):
+        for pair in pairs:
+            a, b = list(pair)
+            if a in ordered and b in ordered:
+                gap = position_gap(ordered, a, b)
+                ok = gap >= MIN_SIMILARITY_GAP
+                row = [label, a, b, gap, "OK" if ok else "要確認"]
+                ws.append(row)
+                ri = ws.max_row
+                for col in range(1, len(hdrs)+1):
+                    c = ws.cell(ri, col)
+                    if not ok: c.fill = WARN_FILL
+                    c.font = Font(name="Arial", size=10)
+                    c.alignment = Alignment(horizontal="center"); c.border = bdr()
+    for i in range(1, len(hdrs)+1):
+        ws.column_dimensions[get_column_letter(i)].width = 18
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -363,13 +454,18 @@ def main():
             print("  {}: {} / {}".format(t["name"], t["song"], t["artist"]))
 
     conflicts = build_conflicts(teams)
+    song_pairs = build_similarity_conflicts(teams, "song")
+    artist_pairs = build_similarity_conflicts(teams, "artist")
     n_blocks = args.n_blocks if args.n_blocks > 0 else (5 if len(teams) > 15 else 4)
-    ordered = greedy_schedule(teams, durations, conflicts, n_blocks=n_blocks, break_sec=MIN_BREAK_MINUTES * 60)
+    ordered = greedy_schedule(teams, durations, conflicts, n_blocks=n_blocks, break_sec=MIN_BREAK_MINUTES * 60,
+                               song_pairs=song_pairs, artist_pairs=artist_pairs)
     blocks = assign_blocks(ordered, n_blocks)
     schedule = calc_schedule(blocks, durations, args.start_time)
     violations = check_violations(ordered, durations, conflicts, schedule=schedule)
+    song_violations = check_similarity_violations(ordered, song_pairs)
+    artist_violations = check_similarity_violations(ordered, artist_pairs)
     prefs = {t["name"]: pref_half(t.get("preferred_time")) for t in teams}
-    remarks = build_remarks(ordered, prefs, violations)
+    remarks = build_remarks(ordered, prefs, violations, song_violations, artist_violations)
 
     wb = Workbook()
     ws1 = wb.active; ws1.title = "セットリスト"
@@ -377,6 +473,9 @@ def main():
     if conflicts:
         ws2 = wb.create_sheet("掛け持ちチェック")
         write_check(ws2, ordered, durations, conflicts, schedule)
+    if song_pairs or artist_pairs:
+        ws3 = wb.create_sheet("曲・アーティスト重複チェック")
+        write_similarity_check(ws3, ordered, song_pairs, artist_pairs)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.output)
 
@@ -389,6 +488,10 @@ def main():
         print("WARNING: {} conflict(s):".format(len(violations)))
         for v in violations:
             print("  {} <-> {}: {}".format(v["team_a"], v["team_b"], v["gap_str"]))
+    if song_violations:
+        print("WARNING: {} song repeat(s) within 2 slots".format(len(song_violations)))
+    if artist_violations:
+        print("WARNING: {} artist repeat(s) within 2 slots".format(len(artist_violations)))
     if missing:
         print("WARNING: {} song(s) not found".format(len(missing)))
 
