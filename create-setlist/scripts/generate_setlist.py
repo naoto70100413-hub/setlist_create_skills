@@ -129,6 +129,7 @@ SHARED_WEIGHT         = 200
 MIN_SIMILARITY_GAP    = 2     # 曲・アーティストは最低2組空ける
 SIMILARITY_WEIGHT     = 40
 PREF_WEIGHT           = 5
+PREF_DEADLINE_DECAY_SEC = 3600   # 指定時刻(before/after)を外れた場合、1時間ズレで実質0点まで減衰
 
 def elapsed_gap(ordered, a, b, durations, boundaries=(), break_sec=0):
     ia, ib = ordered.index(a), ordered.index(b)
@@ -169,9 +170,14 @@ def pref_contribution(pref, i, n, order, durations, boundaries, break_sec, start
                 year=est.year, month=est.month, day=est.day)
         except (ValueError, KeyError):
             return 0
+        # 満たしていれば満点（余裕があっても加点しない）。外れている場合は
+        # 反比例で減衰させ、ズレがどれだけ大きくても常に「近い方が高スコア」を維持する
+        # （PREF_DEADLINE_DECAY_SEC ズレると満点の半分になる）。
         if t == "before":
-            return PREF_WEIGHT if est <= deadline else 0
-        return PREF_WEIGHT if est >= deadline else 0
+            miss = max(0.0, (est - deadline).total_seconds())
+        else:
+            miss = max(0.0, (deadline - est).total_seconds())
+        return PREF_WEIGHT / (1 + miss / PREF_DEADLINE_DECAY_SEC)
     return 0
 
 def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0,
@@ -360,9 +366,11 @@ def build_remarks(ordered, prefs, violations, shared_notes, song_violations, art
             except (ValueError, KeyError):
                 continue
             if t == "before" and actual_start > deadline:
-                add(name, "{}実際は{}開始".format(prefix, actual_start.strftime("%H:%M")), "note")
+                miss = str(actual_start - deadline)
+                add(name, "{}実際は{}開始（希望より{}超過）".format(prefix, actual_start.strftime("%H:%M"), miss), "note")
             elif t == "after" and actual_start < deadline:
-                add(name, "{}実際は{}開始".format(prefix, actual_start.strftime("%H:%M")), "note")
+                miss = str(deadline - actual_start)
+                add(name, "{}実際は{}開始（希望より{}不足）".format(prefix, actual_start.strftime("%H:%M"), miss), "note")
     return remarks
 
 # ── Excel Output ─────────────────────────────────────────────────────────────
