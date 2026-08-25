@@ -95,9 +95,10 @@ NOTE_FONT = Font(color="1A5276", italic=True, name="Arial", size=9)
 ALT_FILL  = PatternFill("solid", start_color="F5F5F5")
 THIN = Side(style="thin", color="BBBBBB")
 
-OUTPUT_COLS = ["チーム名", "曲名", "アーティスト名", "掛け持ちチーム", "希望時間帯"]
-COL_WIDTHS  = [18, 24, 20, 32, 14]
+OUTPUT_COLS = ["受付番号", "チーム名", "曲名", "アーティスト名", "掛け持ちチーム", "希望時間帯"]
+COL_WIDTHS  = [12, 18, 24, 20, 32, 14]
 NOTE_TEXTS  = [
+    "",
     "※ 必須",
     "※ 必須（Spotify検索）",
     "※ 必須（Spotify検索）",
@@ -126,14 +127,14 @@ def write_excel(output_path, result_df, missing_ids):
 
     # Data rows
     for i, row in enumerate(result_df.itertuples(index=False), 2):
-        values = [row.チーム名, row.曲名, row.アーティスト名, row.掛け持ちチーム, row.希望時間帯]
+        values = [row.受付番号, row.チーム名, row.曲名, row.アーティスト名, row.掛け持ちチーム, row.希望時間帯]
         for col, val in enumerate(values, 1):
             c = ws.cell(i, col, val)
             if i % 2 == 0:
                 c.fill = ALT_FILL
             c.font = Font(name="Arial", size=10)
             c.alignment = Alignment(
-                horizontal="left" if col in (1, 2, 3, 4) else "center",
+                horizontal="left" if col in (2, 3, 4, 5) else "center",
                 vertical="center"
             )
             c.border = bdr()
@@ -239,7 +240,8 @@ def main():
     missing_ids = sorted(all_ids - matched_ids)
 
     # Final column order
-    result = merged[["チーム名", "曲名", "アーティスト名", "掛け持ちチーム", "希望時間帯"]].copy()
+    result = merged.rename(columns={"__id__": "受付番号"})
+    result = result[["受付番号", "チーム名", "曲名", "アーティスト名", "掛け持ちチーム", "希望時間帯"]].copy()
     result = result.reset_index(drop=True)
 
     # --- Output ---

@@ -46,6 +46,16 @@ def parse_shared(val):
     if not val or (isinstance(val, float) and math.isnan(val)): return []
     return [t.strip() for t in str(val).split(",") if t.strip()]
 
+def strip_trailing_notes(df):
+    """format-setlist-input が出力するExcelは、データ行の後に空行1行を挟んで
+    注記行（※必須 等）が続く。全列が空の最初の行以降（注記行含む）を切り捨てる。"""
+    def is_blank(row):
+        return all(pd.isna(v) or str(v).strip() == "" for v in row)
+    for pos in range(len(df)):
+        if is_blank(df.iloc[pos]):
+            return df.iloc[:pos].reset_index(drop=True)
+    return df.reset_index(drop=True)
+
 def pref_half(val):
     if not val or (isinstance(val, float) and math.isnan(val)): return None
     return "first" if "前半" in str(val) else ("second" if "後半" in str(val) else None)
@@ -292,10 +302,12 @@ def check_similarity_violations(ordered, pairs):
                 out.append({"team_a":a,"team_b":b,"gap":gap})
     return out
 
-def build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations, schedule=None):
+def build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations,
+                   schedule=None, raw_pref_text=None):
     """文句なしにクリアしていないチームすべてに備考メッセージを組み立てる。
     severity: 'warn' = ルール違反（要対応）, 'note' = 目安未達だが許容範囲（参考情報）"""
     remarks = {name: [] for name in ordered}
+    raw_pref_text = raw_pref_text or {}
     actual_starts = {}
     if schedule:
         for e in schedule:
@@ -327,16 +339,17 @@ def build_remarks(ordered, prefs, violations, shared_notes, song_violations, art
         if not pref:
             continue
         t = pref["type"]
+        raw = str(raw_pref_text.get(name, "") or "").strip()
+        prefix = "希望時間帯未達（原文:「{}」）: ".format(raw) if raw else "希望時間帯未達: "
         if t in ("first", "second"):
             actual = "first" if i < n / 2 else "second"
             if actual != t:
-                want = "前半" if t == "first" else "後半"
                 got = "前半" if actual == "first" else "後半"
-                add(name, "希望時間帯未達: {}希望→{}に配置".format(want, got), "note")
+                add(name, "{}実際は{}に配置".format(prefix, got), "note")
         elif t == "early" and i >= n / 2:
-            add(name, "希望時間帯未達: できるだけ早め希望→出演順{}/{}（後半寄り）".format(i + 1, n), "note")
+            add(name, "{}出演順{}/{}（後半寄り）".format(prefix, i + 1, n), "note")
         elif t == "late" and i < n / 2:
-            add(name, "希望時間帯未達: できるだけ遅め希望→出演順{}/{}（前半寄り）".format(i + 1, n), "note")
+            add(name, "{}出演順{}/{}（前半寄り）".format(prefix, i + 1, n), "note")
         elif t in ("before", "after"):
             actual_start = actual_starts.get(name)
             if actual_start is None:
@@ -347,11 +360,9 @@ def build_remarks(ordered, prefs, violations, shared_notes, song_violations, art
             except (ValueError, KeyError):
                 continue
             if t == "before" and actual_start > deadline:
-                add(name, "希望時間帯未達: {}までの出演希望→実際は{}開始".format(
-                    pref["time"], actual_start.strftime("%H:%M")), "note")
+                add(name, "{}実際は{}開始".format(prefix, actual_start.strftime("%H:%M")), "note")
             elif t == "after" and actual_start < deadline:
-                add(name, "希望時間帯未達: {}以降の出演希望→実際は{}開始".format(
-                    pref["time"], actual_start.strftime("%H:%M")), "note")
+                add(name, "{}実際は{}開始".format(prefix, actual_start.strftime("%H:%M")), "note")
     return remarks
 
 # ── Excel Output ─────────────────────────────────────────────────────────────
@@ -364,8 +375,8 @@ NOTE_FILL   = PatternFill("solid", start_color="E8F4FD")
 ALT_FILL    = PatternFill("solid", start_color="F3F3F3")
 THIN        = Side(style="thin", color="CCCCCC")
 
-BASE_HEADERS    = ["出演順","ブロック内番号","出演開始時間","チーム名","曲名","アーティスト名","出演時間","入りはけ時間"]
-BASE_COL_WIDTHS = [9, 13, 16, 18, 22, 18, 11, 13]
+BASE_HEADERS    = ["出演順","ブロック内番号","出演開始時間","チーム名","受付番号","曲名","アーティスト名","出演時間","入りはけ時間"]
+BASE_COL_WIDTHS = [9, 13, 16, 18, 12, 22, 18, 11, 13]
 
 def bdr():
     return Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -435,7 +446,8 @@ def write_setlist(ws, schedule, df, durations, remarks):
 
         remark_text = "; ".join(text for text, _ in remarks.get(name, []))
         row = [team_num, block_label, fmt_time(entry["start"]),
-               name, info.get("song",""), info.get("artist",""), fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells + [remark_text]
+               name, info.get("entry_id",""), info.get("song",""), info.get("artist",""),
+               fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells + [remark_text]
         ws.append(row)
         ri = ws.max_row
         if name in warn_teams: fill = WARN_FILL
@@ -512,6 +524,7 @@ def main():
     p.add_argument("--start-time", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--n-blocks", type=int, default=0)
+    p.add_argument("--col-id",     default="受付番号")
     p.add_argument("--col-team",   default="チーム名")
     p.add_argument("--col-song",   default="曲名")
     p.add_argument("--col-artist", default="アーティスト名")
@@ -524,13 +537,16 @@ def main():
 
     path = Path(args.input)
     df = pd.read_excel(path) if path.suffix in (".xlsx",".xls") else pd.read_csv(path)
-    col_map = {args.col_team:"name", args.col_song:"song", args.col_artist:"artist",
+    df = strip_trailing_notes(df)
+    col_map = {args.col_id:"entry_id", args.col_team:"name", args.col_song:"song", args.col_artist:"artist",
                args.col_shared:"shared_teams_raw", args.col_pref:"preferred_time"}
     df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
     if "shared_teams_raw" in df.columns:
         df["shared_teams"] = df["shared_teams_raw"].apply(parse_shared)
     else:
         df["shared_teams"] = [[] for _ in range(len(df))]
+    if "entry_id" not in df.columns:
+        df["entry_id"] = ""
     teams = df.to_dict("records")
 
     overrides = json.loads(args.duration_overrides) if args.duration_overrides else {}
@@ -576,8 +592,9 @@ def main():
     song_violations = check_similarity_violations(ordered, song_pairs)
     artist_violations = check_similarity_violations(ordered, artist_pairs)
     prefs = {t["name"]: normalize_pref(pref_overrides.get(t["name"]), t.get("preferred_time")) for t in teams}
+    raw_pref_text = {t["name"]: t.get("preferred_time") for t in teams}
     remarks = build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations,
-                             schedule=schedule)
+                             schedule=schedule, raw_pref_text=raw_pref_text)
 
     wb = Workbook()
     ws1 = wb.active; ws1.title = "セットリスト"
