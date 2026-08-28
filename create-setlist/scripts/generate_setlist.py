@@ -3,7 +3,7 @@
 """dance-setlist: ダンスイベントセットリスト生成スクリプト"""
 import os, sys
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
-import argparse, json, math, time
+import argparse, json, math, random, time
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
@@ -206,8 +206,12 @@ def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0,
 
 def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
                      song_pairs=frozenset(), artist_pairs=frozenset(),
-                     pref_overrides=None, start_dt=None):
+                     pref_overrides=None, start_dt=None, randomize=False):
     names = [t["name"] for t in teams]
+    if randomize:
+        # --seed 指定時: 処理順の同点タイブレークをランダム化し、
+        # 複数回試して比較できるようにする（貪欲法の局所最適回避用）
+        random.shuffle(names)
     pref_overrides = pref_overrides or {}
     prefs = {t["name"]: normalize_pref(pref_overrides.get(t["name"]), t.get("preferred_time")) for t in teams}
     similarity_pairs = (song_pairs, artist_pairs)
@@ -541,7 +545,13 @@ def main():
     p.add_argument("--duration-overrides", default="")
     p.add_argument("--pref-overrides", default="",
                    help='希望時間帯の構造化上書き。例: \'{"TEAM_A":{"type":"early"},"TEAM_B":{"type":"before","time":"15:00"}}\'')
+    p.add_argument("--seed", type=int, default=None,
+                   help="出演順タイブレークをランダム化する乱数シード。同じ入力に対し--seedを変えて"
+                        "複数回実行し、末尾に出力される QUALITY_SUMMARY を比較することで、"
+                        "貪欲法が局所最適に陥った場合の代替案を探索できる。省略時は従来通り決定的。")
     args = p.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
 
     path = Path(args.input)
     df = pd.read_excel(path) if path.suffix in (".xlsx",".xls") else pd.read_csv(path)
@@ -592,7 +602,8 @@ def main():
     start_dt = datetime.strptime(args.start_time, "%H:%M")
     ordered = greedy_schedule(teams, durations, conflicts, n_blocks=n_blocks, break_sec=MIN_BREAK_MINUTES * 60,
                                song_pairs=song_pairs, artist_pairs=artist_pairs,
-                               pref_overrides=pref_overrides, start_dt=start_dt)
+                               pref_overrides=pref_overrides, start_dt=start_dt,
+                               randomize=(args.seed is not None))
     blocks = assign_blocks(ordered, n_blocks)
     schedule = calc_schedule(blocks, durations, args.start_time)
     violations = check_violations(ordered, durations, conflicts, schedule=schedule)
@@ -629,6 +640,18 @@ def main():
         print("WARNING: {} song repeat(s) within 2 slots".format(len(song_violations)))
     if artist_violations:
         print("WARNING: {} artist repeat(s) within 2 slots".format(len(artist_violations)))
+
+    # --seed を変えて複数回実行し比較するための定量サマリー。
+    # warn: 要対応の違反件数(少ないほど良い) / note: 許容範囲の参考件数(少ないほど良い)
+    # min_shared_gap_sec: 掛け持ちペアの中で最も短い間隔(秒、大きいほど良い＝偏りが少ない)
+    warn_count = sum(1 for msgs in remarks.values() if any(sev == "warn" for _, sev in msgs))
+    note_count = sum(1 for msgs in remarks.values() if msgs and not any(sev == "warn" for _, sev in msgs))
+    if conflicts:
+        min_shared_gap = min(real_gap(schedule, *list(pair)) for pair in conflicts)
+    else:
+        min_shared_gap = None
+    print("QUALITY_SUMMARY: warn={} note={} min_shared_gap_sec={}".format(
+        warn_count, note_count, min_shared_gap if min_shared_gap is not None else "NA"))
     if missing:
         print("WARNING: {} song(s) not found".format(len(missing)))
 

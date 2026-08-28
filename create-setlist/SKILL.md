@@ -158,10 +158,37 @@ PYTHONIOENCODING=utf-8 python3 "<SKILL_DIR>/scripts/generate_setlist.py" \
   --n-blocks 4  # デフォルト: チーム数15以下→4、16以上→5
 ```
 
+スクリプトは出演順を決める貪欲法（近似解法）を使っており、常に唯一の最適解を
+保証するものではない。掛け持ちペアが複数あって`WARNING`（掛け持ち間隔不足・
+曲/アーティストの連続）が出た場合は、Step 5-1 で複数パターンを試して最良のものを選ぶ。
+
+### Step 5-1: 警告が出た場合の複数パターン探索（任意）
+
+Step 5 の出力末尾に `QUALITY_SUMMARY: warn=N note=M min_shared_gap_sec=S` という行が
+出力される。`warn`（要対応の違反件数）が0でない場合、`--seed`を変えて数回
+（目安5〜10回、`--seed 1`〜`--seed 10`など）再実行し、`QUALITY_SUMMARY`を比較して
+最良のもの（優先順: warnが最小 → 同点ならnoteが最小 → 同点ならmin_shared_gap_secが最大）
+を採用する。`--output`は試行ごとに一時ファイルへ出し、最良だったものを最終的な
+出力ファイルパスにコピー（またはそのシードで最後にもう一度実行）すること。
+
+```bash
+for seed in 1 2 3 4 5; do
+  PYTHONIOENCODING=utf-8 python3 "<SKILL_DIR>/scripts/generate_setlist.py" \
+    --input "<入力ファイルパス>" --start-time "<開始時刻>" \
+    --output "/tmp/setlist_trial_${seed}.xlsx" \
+    --duration-overrides '<JSON>' --pref-overrides '<JSON>' --seed "$seed"
+done
+```
+
+warnが0にならない場合でも、試行回数の上限（10回程度）に達したら探索を打ち切り、
+その時点で最良の案を採用し、残った警告は正直にユーザーへ報告する。
+（掛け持ち制約が物理的に満たせない入力であれば、何回試しても解消しないことに注意）
+
 ### Step 6: 結果報告
 
 - 生成されたExcelファイルのパスをユーザーに伝える
 - スクリプトが出力するサマリー（チーム数・ブロック数・終了時刻・警告）を表示する
+- 複数パターンを試した場合は、何パターン試して何が改善したか（または改善しなかったか）を伝える
 - ⚠ 警告がある場合（掛け持ち制約の違反・再生時間未取得の曲）は目立つように伝える
 
 ---
