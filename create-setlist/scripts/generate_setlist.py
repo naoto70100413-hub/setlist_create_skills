@@ -4,6 +4,11 @@
 import os, sys
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 import argparse, json, math, random, time
+try:
+    from ortools.sat.python import cp_model
+    HAS_ORTOOLS = True
+except ImportError:
+    HAS_ORTOOLS = False
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
@@ -204,9 +209,10 @@ def score_order(order, durations, conflicts, prefs, n, n_blocks=1, break_sec=0,
         s += pref_contribution(prefs.get(name), i, n, order, durations, boundaries, break_sec, start_dt)
     return s
 
-def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
-                     song_pairs=frozenset(), artist_pairs=frozenset(),
-                     pref_overrides=None, start_dt=None, randomize=False):
+def greedy_schedule_heuristic(teams, durations, conflicts, n_blocks=1, break_sec=0,
+                               song_pairs=frozenset(), artist_pairs=frozenset(),
+                               pref_overrides=None, start_dt=None, randomize=False):
+    """貪欲法（近似解）。ortools が使えない環境向けのフォールバック。"""
     names = [t["name"] for t in teams]
     if randomize:
         # --seed 指定時: 処理順の同点タイブレークをランダム化し、
@@ -233,6 +239,183 @@ def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
             if sc > best_score: best_score, best_pos = sc, pos
         ordered.insert(best_pos, name)
     return ordered
+
+# ── CP-SAT (OR-Tools) による厳密探索 ───────────────────────────────────────────
+#
+# 貪欲法は「一度確定した配置に後戻りしない」ため局所最適に陥り得る。CP-SATは
+# 組み合わせを網羅的に探索する制約ソルバーで、時間内であれば最適解（または
+# それに近い解、探索過程で目的関数の上下界が分かる）を返せる。
+#
+# モデル化の要点:
+#   - team_at_rank[r] / rank_of_team[i]: 出演順(rank)とチームの相互変換（順列）
+#   - dur_at_rank[r]:  rank r にいるチームの所要時間（AddElementで参照）
+#   - start_at_rank[r]: rank r の開始時刻（秒。累積和で計算、ブロック休憩は
+#     compute_block_boundaries と同じ位置で break_sec を加算する近似値）
+#   - start_of_team[i]: チーム i の開始時刻（rank_of_team 経由でElement参照）
+# これにより「掛け持ちペアの間隔」「曲/アーティストの順位差」「希望時間帯との
+# 距離」を全てteam_at_rank/rank_of_teamの整数変数から一意に計算できる。
+
+def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
+                  song_pairs, artist_pairs, pref_overrides, start_dt,
+                  time_limit_sec=15, num_workers=8):
+    names = [t["name"] for t in teams]
+    n = len(names)
+    if n == 0:
+        return []
+    if n == 1:
+        return names[:]
+    idx = {name: i for i, name in enumerate(names)}
+    dur_list = [int(durations.get(name, 0)) for name in names]
+    boundaries = set(compute_block_boundaries(n, n_blocks))
+    pref_overrides = pref_overrides or {}
+    prefs = {name: normalize_pref(pref_overrides.get(name), t.get("preferred_time"))
+             for name, t in zip(names, teams)}
+
+    model = cp_model.CpModel()
+
+    team_at_rank = [model.NewIntVar(0, n - 1, "tar_{}".format(r)) for r in range(n)]
+    rank_of_team = [model.NewIntVar(0, n - 1, "rot_{}".format(i)) for i in range(n)]
+    model.AddInverse(team_at_rank, rank_of_team)
+
+    max_dur = max(dur_list) if dur_list else 0
+    dur_at_rank = [model.NewIntVar(0, max_dur, "dar_{}".format(r)) for r in range(n)]
+    for r in range(n):
+        model.AddElement(team_at_rank[r], dur_list, dur_at_rank[r])
+
+    horizon = sum(dur_list) + 30 * n + break_sec * len(boundaries) + 10
+    start_at_rank = [model.NewIntVar(0, horizon, "sar_{}".format(r)) for r in range(n)]
+    model.Add(start_at_rank[0] == 0)
+    for r in range(1, n):
+        extra = break_sec if r in boundaries else 0
+        model.Add(start_at_rank[r] == start_at_rank[r - 1] + dur_at_rank[r - 1] + 30 + extra)
+
+    start_of_team = [model.NewIntVar(0, horizon, "sot_{}".format(i)) for i in range(n)]
+    for i in range(n):
+        model.AddElement(rank_of_team[i], start_at_rank, start_of_team[i])
+
+    objective_terms = []
+
+    # 1. 掛け持ち間隔（最優先）: 40分未満は強く回避しつつ、1時間到達を目指す。
+    #    さらに「一番厳しいペア」を直接押し上げる項を加え、片方だけ1時間・
+    #    もう片方が極端に短くなる不均衡を避ける。
+    gap_vars = []
+    for pair in conflicts:
+        a, b = list(pair)
+        ia, ib = idx[a], idx[b]
+        diff = model.NewIntVar(-horizon, horizon, "diff_{}_{}".format(a, b))
+        model.Add(diff == start_of_team[ia] - start_of_team[ib])
+        gap = model.NewIntVar(0, horizon, "gap_{}_{}".format(a, b))
+        model.AddAbsEquality(gap, diff)
+        gap_vars.append(gap)
+        capped = model.NewIntVar(0, IDEAL_SHARED_GAP_SEC, "capped_{}_{}".format(a, b))
+        model.Add(capped <= gap)
+        model.Add(capped <= IDEAL_SHARED_GAP_SEC)
+        objective_terms.append((SHARED_WEIGHT, capped))
+    if gap_vars:
+        min_gap = model.NewIntVar(0, horizon, "min_shared_gap")
+        model.AddMinEquality(min_gap, gap_vars)
+        # 最も厳しいペアの底上げを重視（不均衡回避）。40分に達すれば頭打ち。
+        min_gap_capped = model.NewIntVar(0, MIN_SHARED_GAP_SEC, "min_shared_gap_capped")
+        model.Add(min_gap_capped <= min_gap)
+        model.Add(min_gap_capped <= MIN_SHARED_GAP_SEC)
+        objective_terms.append((SHARED_WEIGHT * 3, min_gap_capped))
+
+    # 2. 曲・アーティストの連続回避（2番目）: 順位差(-1)を最低2組まで評価
+    for pairs in (song_pairs, artist_pairs):
+        for pair in pairs:
+            a, b = list(pair)
+            ia, ib = idx[a], idx[b]
+            rdiff = model.NewIntVar(-n, n, "rdiff_{}_{}".format(a, b))
+            model.Add(rdiff == rank_of_team[ia] - rank_of_team[ib])
+            rabs = model.NewIntVar(0, n, "rabs_{}_{}".format(a, b))
+            model.AddAbsEquality(rabs, rdiff)
+            pos_gap = model.NewIntVar(0, n, "posgap_{}_{}".format(a, b))
+            model.Add(pos_gap == rabs - 1)
+            capped_sim = model.NewIntVar(0, MIN_SIMILARITY_GAP, "cappedsim_{}_{}".format(a, b))
+            model.Add(capped_sim <= pos_gap)
+            model.Add(capped_sim <= MIN_SIMILARITY_GAP)
+            objective_terms.append((SIMILARITY_WEIGHT // MIN_SIMILARITY_GAP, capped_sim))
+
+    # 3. 希望時間帯（最下位）
+    half = n // 2
+    for i, name in enumerate(names):
+        pref = prefs.get(name)
+        if not pref:
+            continue
+        t = pref["type"]
+        if t == "first":
+            b = model.NewBoolVar("pref_first_{}".format(i))
+            model.Add(rank_of_team[i] < half).OnlyEnforceIf(b)
+            model.Add(rank_of_team[i] >= half).OnlyEnforceIf(b.Not())
+            objective_terms.append((PREF_WEIGHT, b))
+        elif t == "second":
+            b = model.NewBoolVar("pref_second_{}".format(i))
+            model.Add(rank_of_team[i] >= half).OnlyEnforceIf(b)
+            model.Add(rank_of_team[i] < half).OnlyEnforceIf(b.Not())
+            objective_terms.append((PREF_WEIGHT, b))
+        elif t == "early":
+            # rank が小さいほど良い → -rank を最大化（重みは元の連続評価と概ね揃える）
+            objective_terms.append((-1, rank_of_team[i]))
+        elif t == "late":
+            objective_terms.append((1, rank_of_team[i]))
+        elif t in ("before", "after") and start_dt is not None:
+            try:
+                deadline_dt = datetime.strptime(pref["time"], "%H:%M").replace(
+                    year=start_dt.year, month=start_dt.month, day=start_dt.day)
+            except (ValueError, KeyError):
+                continue
+            deadline_sec = int((deadline_dt - start_dt).total_seconds())
+            if deadline_sec < 0:
+                continue
+            # 未達の場合は線形にペナルティ（際限なく差を評価し続ける。
+            # CP-SATは厳密探索のため、貪欲法のような「反比例で減衰」の
+            # 工夫がなくても、際限のない線形差で十分「近い方を優先」できる）
+            penalty_rate = PREF_WEIGHT / (2.0 * PREF_DEADLINE_DECAY_SEC)
+            # over/short は「開始時刻 - 指定時刻」の差なので、horizon（総所要時間）
+            # だけでなく deadline_sec 自体も超え得る。両方をカバーする上限にする。
+            deadline_slack = horizon + deadline_sec + 10
+            if t == "before":
+                over = model.NewIntVar(0, deadline_slack, "over_{}".format(i))
+                model.AddMaxEquality(over, [start_of_team[i] - deadline_sec, 0])
+                objective_terms.append((-penalty_rate, over))
+            else:
+                short = model.NewIntVar(0, deadline_slack, "short_{}".format(i))
+                model.AddMaxEquality(short, [deadline_sec - start_of_team[i], 0])
+                objective_terms.append((-penalty_rate, short))
+
+    # 目的関数の重みには小数(penalty_rate)が混在するため、全体を整数スケールに統一する。
+    OBJ_SCALE = 10000
+    model.Maximize(sum(int(round(w * OBJ_SCALE)) * v for w, v in objective_terms))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit_sec
+    solver.parameters.num_search_workers = num_workers
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+    order_by_rank = [None] * n
+    for r in range(n):
+        order_by_rank[r] = names[solver.Value(team_at_rank[r])]
+    return order_by_rank
+
+def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
+                     song_pairs=frozenset(), artist_pairs=frozenset(),
+                     pref_overrides=None, start_dt=None, randomize=False):
+    """出演順を決定する。ortools(CP-SAT)が使えれば厳密探索を優先し、
+    使えない/失敗した場合は貪欲法(greedy_schedule_heuristic)にフォールバックする。"""
+    if HAS_ORTOOLS:
+        try:
+            result = _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
+                                   song_pairs, artist_pairs, pref_overrides, start_dt)
+            if result is not None:
+                return result
+            sys.stderr.write("[CP-SAT] 実行可能解が見つからなかったため貪欲法にフォールバックします\n")
+        except Exception as e:
+            sys.stderr.write("[CP-SAT Error] {} → 貪欲法にフォールバックします\n".format(e))
+    else:
+        sys.stderr.write("[Info] ortools が未インストールのため貪欲法（近似解）を使用します\n")
+    return greedy_schedule_heuristic(teams, durations, conflicts, n_blocks, break_sec,
+                                      song_pairs, artist_pairs, pref_overrides, start_dt, randomize)
 
 def assign_blocks(ordered, n_blocks):
     n = len(ordered)
