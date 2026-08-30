@@ -7,6 +7,7 @@ import os, sys
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 
 import argparse
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -61,21 +62,73 @@ def dedup_by_latest_timestamp(df, id_col, ts_col, label):
     return df.drop(columns=["_ts_parsed"]).sort_index()
 
 
-def merge_shared_teams(row, shared_cols):
-    """掛け持ち列群の値を収集してカンマ区切りの1文字列に統合する。"""
+def normalize_entry_id(val):
+    """受付番号列の書式ゆれ（「01 チーム名」等の余分な文字列付与）に対応し、
+    先頭の数字部分だけを抽出する。数字が見つからなければ元の値をそのまま使う。"""
+    v = str(val).strip()
+    m = re.match(r"\s*(\d+)", v)
+    return m.group(1) if m else v
+
+
+PLACEHOLDER_TEAM_NAMES = {"", "未定", "tbd", "未確定", "調整中", "なし"}
+
+
+def resolve_placeholder_name(name, entry_id):
+    """出演者情報フォーム未提出等でチーム名が未定のまま複数チームがいると
+    仮名が衝突するため、受付番号を付記した一意な仮名にする。"""
+    n = str(name).strip()
+    if n.lower() in PLACEHOLDER_TEAM_NAMES:
+        return "未定(No.{})".format(entry_id)
+    return n
+
+
+def _cut_before_marker(val):
+    """「チーム名/曲名」「チーム名（備考）」のような形式から、前半のチーム名候補を取り出す。"""
+    v = val
+    for marker in ("／", "/", "（", "("):
+        if marker in v:
+            candidate = v.split(marker)[0].strip()
+            if candidate:
+                v = candidate
+            break
+    return v
+
+
+def merge_shared_teams(row, shared_cols, known_teams=None):
+    """掛け持ち列群の値を収集してカンマ区切りの1文字列に統合する。
+    既知のチーム名リスト(known_teams)があれば、「チーム名/曲名」形式や
+    区切り文字で分割した際にチーム名自体が壊れないよう復元を試みる。"""
+    known_teams = known_teams or set()
     teams = []
     for col in shared_cols:
         val = str(row.get(col, "")).strip()
         if not val:
             continue
-        # オーバーフロー列はすでにカンマ・読点・スペース区切りの場合があるので分割
+        if val in known_teams:
+            teams.append(val)
+            continue
+        cut_val = _cut_before_marker(val)
+        if cut_val in known_teams:
+            teams.append(cut_val)
+            continue
+        # オーバーフロー列はすでにカンマ・読点・スペース区切りの場合があるので分割。
+        # ただしチーム名自体に読点等を含むケースがあるため、分割片を既知の
+        # チーム名リストに対して前方から結合復元できないか試みる。
         for sep in (",", "、", "・", "　", " "):
-            if sep in val:
-                parts = [p.strip() for p in val.split(sep) if p.strip()]
-                teams.extend(parts)
+            if sep in cut_val:
+                parts = [p.strip() for p in cut_val.split(sep) if p.strip()]
+                resolved, buf = [], ""
+                for p in parts:
+                    buf = (buf + sep + p) if buf else p
+                    if buf in known_teams:
+                        resolved.append(buf)
+                        buf = ""
+                if buf:
+                    resolved.append(buf)
+                teams.extend(resolved if resolved else parts)
                 break
         else:
-            teams.append(val)
+            teams.append(cut_val)
     # 重複除去（順序保持）
     seen = set()
     unique = []
@@ -84,6 +137,19 @@ def merge_shared_teams(row, shared_cols):
             seen.add(t)
             unique.append(t)
     return ", ".join(unique)
+
+
+def find_duplicate_suspects(result_df):
+    """曲名・アーティスト名が完全一致する行が複数の受付番号にまたがっている場合、
+    重複申込の疑いとして検出する（氏名・メールは本スクリプトの入力に含まれないため、
+    曲・アーティストの一致のみで判定する簡易版）。"""
+    groups = {}
+    for _, row in result_df.iterrows():
+        key = (row["曲名"], row["アーティスト名"])
+        if not key[0] and not key[1]:
+            continue
+        groups.setdefault(key, []).append(row["受付番号"])
+    return {k: v for k, v in groups.items() if len(v) > 1}
 
 
 # ── Excel Output ─────────────────────────────────────────────────────────────
@@ -111,7 +177,15 @@ def bdr():
     return Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-def write_excel(output_path, result_df, missing_ids):
+def neutralize_formula_cell(cell):
+    """アーティスト名等が =LOVE のように =+-@ で始まると、Excel/openpyxlが
+    数式と誤解釈して値が消えることがある。該当セルは明示的に文字列型にする。"""
+    v = cell.value
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+        cell.data_type = "s"
+
+
+def write_excel(output_path, result_df, missing_ids, duplicate_suspects=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "出演チームリスト"
@@ -138,6 +212,7 @@ def write_excel(output_path, result_df, missing_ids):
                 vertical="center"
             )
             c.border = bdr()
+            neutralize_formula_cell(c)
         ws.row_dimensions[i].height = 16
 
     # Notes row
@@ -158,6 +233,31 @@ def write_excel(output_path, result_df, missing_ids):
         for i, mid in enumerate(missing_ids, 2):
             ws2.cell(i, 1, mid)
         ws2.column_dimensions["A"].width = 30
+
+    # Warning sheet for suspected duplicate submissions
+    if duplicate_suspects:
+        ws3 = wb.create_sheet("重複疑いチェック")
+        hdrs = ["曲名", "アーティスト名", "該当受付番号", "備考"]
+        ws3.append(hdrs)
+        for col in range(1, len(hdrs) + 1):
+            c = ws3.cell(1, col)
+            c.fill = HDR_FILL; c.font = HDR_FONT
+            c.alignment = Alignment(horizontal="center"); c.border = bdr()
+        for (song, artist), ids in duplicate_suspects.items():
+            row = [song, artist, ", ".join(str(i) for i in ids),
+                   "曲・アーティストが一致（氏名/メールは未照合）。出演者情報フォーム提出済みの方を正としてください"]
+            ws3.append(row)
+            ri = ws3.max_row
+            for col in range(1, len(hdrs) + 1):
+                c = ws3.cell(ri, col)
+                c.fill = NOTE_FILL
+                c.font = Font(name="Arial", size=10)
+                c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+                c.border = bdr()
+                neutralize_formula_cell(c)
+        widths = [24, 20, 24, 40]
+        for i, w in enumerate(widths, 1):
+            ws3.column_dimensions[get_column_letter(i)].width = w
 
     # Column widths (main sheet)
     for i, w in enumerate(COL_WIDTHS, 1):
@@ -204,6 +304,10 @@ def main():
         if val is None:
             sys.exit("[ERROR] 列が見つかりません: {}".format(name))
 
+    # --- 受付番号の書式ゆれ（「01 チーム名」等）を吸収し、先頭の数字だけに正規化 ---
+    df_songs[id_col_s] = df_songs[id_col_s].apply(normalize_entry_id)
+    df_teams[id_col_t] = df_teams[id_col_t].apply(normalize_entry_id)
+
     # --- 受付番号の重複行はタイムスタンプが新しい方を採用 ---
     df_songs = dedup_by_latest_timestamp(df_songs, id_col_s, ts_col_s, "曲情報")
     df_teams = dedup_by_latest_timestamp(df_teams, id_col_t, ts_col_t, "チーム情報")
@@ -215,6 +319,9 @@ def main():
     else:
         print("掛け持ち列なし（掛け持ちチーム列は空欄で出力します）")
 
+    # 掛け持ち列の名寄せで使う既知のチーム名一覧（リネーム前の生の値）
+    known_teams = {str(v).strip() for v in df_teams[team_col] if str(v).strip()}
+
     # --- Rename to canonical names ---
     df_songs = df_songs.rename(columns={id_col_s: "__id__", song_col: "曲名", artist_col: "アーティスト名"})
     df_teams = df_teams.rename(columns={id_col_t: "__id__", team_col: "チーム名"})
@@ -223,9 +330,13 @@ def main():
     else:
         df_teams["希望時間帯"] = ""
 
+    # --- チーム名未定の申込は受付番号を付記した一意な仮名にする ---
+    df_teams["チーム名"] = [resolve_placeholder_name(n, i)
+                           for n, i in zip(df_teams["チーム名"], df_teams["__id__"])]
+
     # --- Merge shared team columns ---
     df_teams["掛け持ちチーム"] = df_teams.apply(
-        lambda row: merge_shared_teams(row, shared_cols), axis=1
+        lambda row: merge_shared_teams(row, shared_cols, known_teams), axis=1
     )
 
     # --- Join on __id__ ---
@@ -250,7 +361,8 @@ def main():
     else:
         out_path = "setlist_input_{}.xlsx".format(datetime.now().strftime("%Y%m%d"))
 
-    write_excel(out_path, result, missing_ids)
+    duplicate_suspects = find_duplicate_suspects(result)
+    write_excel(out_path, result, missing_ids, duplicate_suspects)
 
     print("FORMATTER COMPLETE: {}".format(out_path))
     print("  {} チームを出力しました".format(len(result)))
@@ -260,6 +372,9 @@ def main():
             print("  - {}".format(mid))
         if len(missing_ids) > 5:
             print("  ... 他 {} 件".format(len(missing_ids) - 5))
+    if duplicate_suspects:
+        print("WARNING: 重複申込の疑いが {} 組 → 「重複疑いチェック」シートを確認してください".format(
+            len(duplicate_suspects)))
     print("次のステップ: このファイルを dance-setlist スキルの入力として使用できます")
 
 

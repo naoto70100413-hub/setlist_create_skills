@@ -69,7 +69,11 @@ def pref_half(val):
 #   first/second = 前半/後半（従来どおり）
 #   early/late   = できるだけ早め/遅めがいい（連続的な希望）
 #   before/after = 指定時刻(HH:MM)より前/後に出演したい（"time"キーが必須）
-PREF_TYPES = ("first", "second", "early", "late", "before", "after")
+#   block        = ○部を厳密に指定（"block"キー=1始まりの部番号が必須）。
+#                  非推奨: ブロック数(n_blocks)を変更すると指定がズレて悪化するため、
+#                  可能な限り first/second/early/late 等ブロック数に依存しない
+#                  表現に変換すること。
+PREF_TYPES = ("first", "second", "early", "late", "before", "after", "block")
 
 def normalize_pref(override, raw_val):
     """--pref-overrides で渡された構造化データを優先し、なければ従来通り
@@ -80,9 +84,29 @@ def normalize_pref(override, raw_val):
             if not override.get("time"):
                 return None
             return {"type": t, "time": override["time"]}
+        if t == "block":
+            if not override.get("block"):
+                return None
+            try:
+                return {"type": t, "block": int(override["block"])}
+            except (TypeError, ValueError):
+                return None
         return {"type": t}
     half = pref_half(raw_val)
     return {"type": half} if half else None
+
+def pref_label(pref):
+    """希望時間帯の解釈結果を人間可読なラベルにする（チェックシート用）。"""
+    t = pref["type"]
+    return {
+        "first": "前半希望",
+        "second": "後半希望",
+        "early": "できるだけ早め希望",
+        "late": "できるだけ遅め希望",
+        "before": "{}までに出演希望".format(pref.get("time", "?")),
+        "after": "{}以降に出演希望".format(pref.get("time", "?")),
+        "block": "{}部指定希望".format(pref.get("block", "?")),
+    }.get(t, t)
 
 def build_conflicts(teams):
     names = {t["name"] for t in teams}
@@ -112,6 +136,18 @@ def position_gap(order, a, b):
     """a と b の間に挟まるチーム数を返す。"""
     ia, ib = order.index(a), order.index(b)
     return abs(ib - ia) - 1
+
+def block_of_rank(n, n_blocks):
+    """assign_blocks と同じ分割ルールで、各rank(0-indexed)が何番目のブロック
+    (0-indexed)に属するかを表すリスト(長さn)を返す。"""
+    if n_blocks <= 0:
+        return [0] * n
+    base, extra = divmod(n, n_blocks)
+    out = []
+    for b in range(n_blocks):
+        size = base + (1 if b < extra else 0)
+        out.extend([b] * size)
+    return out
 
 def compute_block_boundaries(n, n_blocks):
     """assign_blocks と同じ分割ルールで、休憩が入る位置（0-indexed、
@@ -255,21 +291,18 @@ def greedy_schedule_heuristic(teams, durations, conflicts, n_blocks=1, break_sec
 # これにより「掛け持ちペアの間隔」「曲/アーティストの順位差」「希望時間帯との
 # 距離」を全てteam_at_rank/rank_of_teamの整数変数から一意に計算できる。
 
-def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
-                  song_pairs, artist_pairs, pref_overrides, start_dt,
-                  time_limit_sec=15, num_workers=8):
+def _cpsat_build_and_solve(teams, durations, conflicts, n_blocks, break_sec,
+                            song_pairs, artist_pairs, prefs, start_dt,
+                            time_limit_sec, num_workers,
+                            hard_min_shared_gap, hard_similarity, hard_pref,
+                            shared_ideal_off):
     names = [t["name"] for t in teams]
     n = len(names)
-    if n == 0:
-        return []
-    if n == 1:
-        return names[:]
     idx = {name: i for i, name in enumerate(names)}
     dur_list = [int(durations.get(name, 0)) for name in names]
-    boundaries = set(compute_block_boundaries(n, n_blocks))
-    pref_overrides = pref_overrides or {}
-    prefs = {name: normalize_pref(pref_overrides.get(name), t.get("preferred_time"))
-             for name, t in zip(names, teams)}
+    boundaries = compute_block_boundaries(n, n_blocks)
+    boundary_set = set(boundaries)
+    block_lookup = block_of_rank(n, n_blocks) if n_blocks else None
 
     model = cp_model.CpModel()
 
@@ -282,12 +315,45 @@ def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
     for r in range(n):
         model.AddElement(team_at_rank[r], dur_list, dur_at_rank[r])
 
-    horizon = sum(dur_list) + 30 * n + break_sec * len(boundaries) + 10
+    # 15分丸めにより休憩1回あたり最大900秒(15分)の余白が追加され得るため、
+    # ブロック境界の数だけ余白を見込んでおく（過小だとINFEASIBLEになる）。
+    horizon = sum(dur_list) + 30 * n + (break_sec + 900) * len(boundaries) + 10
+
+    # 真夜中からの秒数（開始時刻が分かる場合のみ）。休憩終了時刻の15分丸めは
+    # 「絶対時刻の分」に依存するため、相対秒数だけでは再現できない。
+    midnight_offset = None
+    if start_dt is not None:
+        midnight_offset = start_dt.hour * 3600 + start_dt.minute * 60 + start_dt.second
+
     start_at_rank = [model.NewIntVar(0, horizon, "sar_{}".format(r)) for r in range(n)]
     model.Add(start_at_rank[0] == 0)
     for r in range(1, n):
-        extra = break_sec if r in boundaries else 0
-        model.Add(start_at_rank[r] == start_at_rank[r - 1] + dur_at_rank[r - 1] + 30 + extra)
+        if r not in boundary_set:
+            model.Add(start_at_rank[r] == start_at_rank[r - 1] + dur_at_rank[r - 1] + 30)
+            continue
+        rel_break_start = model.NewIntVar(0, horizon, "relbs_{}".format(r))
+        model.Add(rel_break_start == start_at_rank[r - 1] + dur_at_rank[r - 1] + 30)
+        if midnight_offset is None:
+            # 開始時刻が不明な場合は従来通り固定break_secで近似する。
+            model.Add(start_at_rank[r] == rel_break_start + break_sec)
+            continue
+        # 最終出力(round_up_15)と一致させる: 休憩開始+最低休憩時間の「絶対秒数」を
+        # 900秒(15分)単位に切り上げる。900は60の倍数のため、round_up_15が行う
+        # 「まず分単位に切り上げ→次に15分単位に切り上げ」と結果が一致する。
+        abs_x = model.NewIntVar(0, horizon + midnight_offset + break_sec + 10,
+                                 "absx_{}".format(r))
+        model.Add(abs_x == rel_break_start + break_sec + midnight_offset)
+        rem900 = model.NewIntVar(0, 899, "rem900_{}".format(r))
+        model.AddModuloEquality(rem900, abs_x, 900)
+        is_exact = model.NewBoolVar("isexact_{}".format(r))
+        model.Add(rem900 == 0).OnlyEnforceIf(is_exact)
+        model.Add(rem900 != 0).OnlyEnforceIf(is_exact.Not())
+        pad = model.NewIntVar(0, 900, "pad_{}".format(r))
+        model.Add(pad == 0).OnlyEnforceIf(is_exact)
+        model.Add(pad == 900 - rem900).OnlyEnforceIf(is_exact.Not())
+        abs_break_end = model.NewIntVar(0, horizon + midnight_offset + 1000, "abe_{}".format(r))
+        model.Add(abs_break_end == abs_x + pad)
+        model.Add(start_at_rank[r] == abs_break_end - midnight_offset)
 
     start_of_team = [model.NewIntVar(0, horizon, "sot_{}".format(i)) for i in range(n)]
     for i in range(n):
@@ -307,10 +373,13 @@ def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
         gap = model.NewIntVar(0, horizon, "gap_{}_{}".format(a, b))
         model.AddAbsEquality(gap, diff)
         gap_vars.append(gap)
-        capped = model.NewIntVar(0, IDEAL_SHARED_GAP_SEC, "capped_{}_{}".format(a, b))
-        model.Add(capped <= gap)
-        model.Add(capped <= IDEAL_SHARED_GAP_SEC)
-        objective_terms.append((SHARED_WEIGHT, capped))
+        if hard_min_shared_gap:
+            model.Add(gap >= MIN_SHARED_GAP_SEC)
+        if not shared_ideal_off:
+            capped = model.NewIntVar(0, IDEAL_SHARED_GAP_SEC, "capped_{}_{}".format(a, b))
+            model.Add(capped <= gap)
+            model.Add(capped <= IDEAL_SHARED_GAP_SEC)
+            objective_terms.append((SHARED_WEIGHT, capped))
     if gap_vars:
         min_gap = model.NewIntVar(0, horizon, "min_shared_gap")
         model.AddMinEquality(min_gap, gap_vars)
@@ -331,12 +400,14 @@ def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
             model.AddAbsEquality(rabs, rdiff)
             pos_gap = model.NewIntVar(0, n, "posgap_{}_{}".format(a, b))
             model.Add(pos_gap == rabs - 1)
+            if hard_similarity:
+                model.Add(pos_gap >= MIN_SIMILARITY_GAP)
             capped_sim = model.NewIntVar(0, MIN_SIMILARITY_GAP, "cappedsim_{}_{}".format(a, b))
             model.Add(capped_sim <= pos_gap)
             model.Add(capped_sim <= MIN_SIMILARITY_GAP)
             objective_terms.append((SIMILARITY_WEIGHT // MIN_SIMILARITY_GAP, capped_sim))
 
-    # 3. 希望時間帯（最下位）
+    # 3. 希望時間帯（最下位）。early/lateは連続的な希望のためハード化しない。
     half = n // 2
     for i, name in enumerate(names):
         pref = prefs.get(name)
@@ -348,16 +419,31 @@ def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
             model.Add(rank_of_team[i] < half).OnlyEnforceIf(b)
             model.Add(rank_of_team[i] >= half).OnlyEnforceIf(b.Not())
             objective_terms.append((PREF_WEIGHT, b))
+            if hard_pref:
+                model.Add(rank_of_team[i] < half)
         elif t == "second":
             b = model.NewBoolVar("pref_second_{}".format(i))
             model.Add(rank_of_team[i] >= half).OnlyEnforceIf(b)
             model.Add(rank_of_team[i] < half).OnlyEnforceIf(b.Not())
             objective_terms.append((PREF_WEIGHT, b))
+            if hard_pref:
+                model.Add(rank_of_team[i] >= half)
         elif t == "early":
             # rank が小さいほど良い → -rank を最大化（重みは元の連続評価と概ね揃える）
             objective_terms.append((-1, rank_of_team[i]))
         elif t == "late":
             objective_terms.append((1, rank_of_team[i]))
+        elif t == "block" and block_lookup is not None:
+            blk = pref.get("block", 0) - 1
+            if 0 <= blk < n_blocks:
+                block_of_i = model.NewIntVar(0, n_blocks - 1, "blockof_{}".format(i))
+                model.AddElement(rank_of_team[i], block_lookup, block_of_i)
+                b = model.NewBoolVar("pref_block_{}".format(i))
+                model.Add(block_of_i == blk).OnlyEnforceIf(b)
+                model.Add(block_of_i != blk).OnlyEnforceIf(b.Not())
+                objective_terms.append((PREF_WEIGHT, b))
+                if hard_pref:
+                    model.Add(block_of_i == blk)
         elif t in ("before", "after") and start_dt is not None:
             try:
                 deadline_dt = datetime.strptime(pref["time"], "%H:%M").replace(
@@ -378,38 +464,99 @@ def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
                 over = model.NewIntVar(0, deadline_slack, "over_{}".format(i))
                 model.AddMaxEquality(over, [start_of_team[i] - deadline_sec, 0])
                 objective_terms.append((-penalty_rate, over))
+                if hard_pref:
+                    model.Add(start_of_team[i] <= deadline_sec)
             else:
                 short = model.NewIntVar(0, deadline_slack, "short_{}".format(i))
                 model.AddMaxEquality(short, [deadline_sec - start_of_team[i], 0])
                 objective_terms.append((-penalty_rate, short))
+                if hard_pref:
+                    model.Add(start_of_team[i] >= deadline_sec)
 
     # 目的関数の重みには小数(penalty_rate)が混在するため、全体を整数スケールに統一する。
     OBJ_SCALE = 10000
-    model.Maximize(sum(int(round(w * OBJ_SCALE)) * v for w, v in objective_terms))
+    if objective_terms:
+        model.Maximize(sum(int(round(w * OBJ_SCALE)) * v for w, v in objective_terms))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_sec
     solver.parameters.num_search_workers = num_workers
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return None
-    order_by_rank = [None] * n
-    for r in range(n):
-        order_by_rank[r] = names[solver.Value(team_at_rank[r])]
-    return order_by_rank
+        return None, status
+    order_by_rank = [names[solver.Value(team_at_rank[r])] for r in range(n)]
+    return order_by_rank, status
+
+def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
+                  song_pairs, artist_pairs, pref_overrides, start_dt,
+                  time_limit_sec=60, num_workers=8,
+                  hard_min_shared_gap=False, hard_similarity=False, hard_pref=False,
+                  shared_ideal_off=False):
+    names = [t["name"] for t in teams]
+    n = len(names)
+    if n == 0:
+        return []
+    if n == 1:
+        return names[:]
+    pref_overrides = pref_overrides or {}
+    prefs = {name: normalize_pref(pref_overrides.get(name), t.get("preferred_time"))
+             for name, t in zip(names, teams)}
+
+    # 優先度順（掛け持ち間隔 > 曲/アーティスト連続 > 希望時間帯）に従い、
+    # 要求されたハード制約を全て満たす解をまず試み、見つからなければ
+    # 優先度の低いものから自動的にソフト制約へ緩和して再探索する。
+    attempts = [(hard_pref, hard_min_shared_gap, hard_similarity)]
+    p, g, s = hard_pref, hard_min_shared_gap, hard_similarity
+    if p:
+        p = False
+        attempts.append((p, g, s))
+    if s:
+        s = False
+        attempts.append((p, g, s))
+    if g:
+        g = False
+        attempts.append((p, g, s))
+
+    for attempt_i, (p_i, g_i, s_i) in enumerate(attempts):
+        result, status = _cpsat_build_and_solve(
+            teams, durations, conflicts, n_blocks, break_sec, song_pairs, artist_pairs,
+            prefs, start_dt, time_limit_sec, num_workers,
+            g_i, s_i, p_i, shared_ideal_off)
+        if result is not None:
+            if attempt_i > 0:
+                relaxed = []
+                if hard_pref and not p_i: relaxed.append("希望時間帯")
+                if hard_similarity and not s_i: relaxed.append("曲/アーティスト連続")
+                if hard_min_shared_gap and not g_i: relaxed.append("掛け持ち間隔")
+                sys.stderr.write(
+                    "[CP-SAT] 要求された全ハード制約では解が見つからなかったため、"
+                    "優先度の低い順にソフト制約へ緩和しました（緩和した項目: {}）\n".format(
+                        "、".join(relaxed)))
+            return result
+
+    return None
 
 def greedy_schedule(teams, durations, conflicts, n_blocks=1, break_sec=0,
                      song_pairs=frozenset(), artist_pairs=frozenset(),
-                     pref_overrides=None, start_dt=None, randomize=False):
+                     pref_overrides=None, start_dt=None, randomize=False,
+                     time_limit_sec=60, hard_min_shared_gap=False, hard_similarity=False,
+                     hard_pref=False, shared_ideal_off=False):
     """出演順を決定する。ortools(CP-SAT)が使えれば厳密探索を優先し、
     使えない/失敗した場合は貪欲法(greedy_schedule_heuristic)にフォールバックする。"""
     if HAS_ORTOOLS:
         try:
             result = _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
-                                   song_pairs, artist_pairs, pref_overrides, start_dt)
+                                   song_pairs, artist_pairs, pref_overrides, start_dt,
+                                   time_limit_sec=time_limit_sec,
+                                   hard_min_shared_gap=hard_min_shared_gap,
+                                   hard_similarity=hard_similarity,
+                                   hard_pref=hard_pref,
+                                   shared_ideal_off=shared_ideal_off)
             if result is not None:
                 return result
-            sys.stderr.write("[CP-SAT] 実行可能解が見つからなかったため貪欲法にフォールバックします\n")
+            sys.stderr.write("[CP-SAT] 実行可能解が見つからなかったため貪欲法にフォールバックします"
+                              "（--hard-min-shared-gap/--hard-similarity 指定時はこれらを外すと"
+                              "解けることがあります）\n")
         except Exception as e:
             sys.stderr.write("[CP-SAT Error] {} → 貪欲法にフォールバックします\n".format(e))
     else:
@@ -496,11 +643,12 @@ def check_similarity_violations(ordered, pairs):
     return out
 
 def build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations,
-                   schedule=None, raw_pref_text=None):
+                   schedule=None, raw_pref_text=None, n_blocks=None):
     """文句なしにクリアしていないチームすべてに備考メッセージを組み立てる。
     severity: 'warn' = ルール違反（要対応）, 'note' = 目安未達だが許容範囲（参考情報）"""
     remarks = {name: [] for name in ordered}
     raw_pref_text = raw_pref_text or {}
+    block_lookup = block_of_rank(len(ordered), n_blocks) if n_blocks else None
     actual_starts = {}
     if schedule:
         for e in schedule:
@@ -558,7 +706,59 @@ def build_remarks(ordered, prefs, violations, shared_notes, song_violations, art
             elif t == "after" and actual_start < deadline:
                 miss = str(deadline - actual_start)
                 add(name, "{}実際は{}開始（希望より{}不足）".format(prefix, actual_start.strftime("%H:%M"), miss), "note")
+        elif t == "block":
+            actual_block = block_lookup[i] + 1 if block_lookup else None
+            if actual_block is not None and actual_block != pref.get("block"):
+                add(name, "{}実際は{}部に配置".format(prefix, actual_block), "note")
     return remarks
+
+def build_pref_checks(ordered, prefs, raw_pref_text, schedule, n_blocks):
+    """「希望時間帯チェック」シート用に、各チームの希望と実際の結果を一覧化する。"""
+    n = len(ordered)
+    block_lookup = block_of_rank(n, n_blocks) if n_blocks else None
+    actual_starts = {}
+    if schedule:
+        for e in schedule:
+            if e.get("type") == "team":
+                actual_starts[e["name"]] = e["start"]
+    rows = []
+    for i, name in enumerate(ordered):
+        pref = prefs.get(name)
+        if not pref:
+            continue
+        t = pref["type"]
+        raw = str(raw_pref_text.get(name, "") or "").strip()
+        label = pref_label(pref)
+        ok, actual = None, ""
+        if t in ("first", "second"):
+            actual_half = "前半" if i < n / 2 else "後半"
+            ok = (actual_half == "前半") == (t == "first")
+            actual = "{}（{}/{}番目）".format(actual_half, i + 1, n)
+        elif t == "early":
+            ok = i < n / 2
+            actual = "出演順{}/{}".format(i + 1, n)
+        elif t == "late":
+            ok = i >= n / 2
+            actual = "出演順{}/{}".format(i + 1, n)
+        elif t == "block" and block_lookup:
+            actual_block = block_lookup[i] + 1
+            ok = (actual_block == pref.get("block"))
+            actual = "{}部".format(actual_block)
+        elif t in ("before", "after"):
+            actual_start = actual_starts.get(name)
+            if actual_start is None:
+                continue
+            try:
+                deadline = datetime.strptime(pref["time"], "%H:%M").replace(
+                    year=actual_start.year, month=actual_start.month, day=actual_start.day)
+            except (ValueError, KeyError):
+                continue
+            ok = (actual_start <= deadline) if t == "before" else (actual_start >= deadline)
+            actual = "{}開始".format(actual_start.strftime("%H:%M"))
+        else:
+            continue
+        rows.append({"name": name, "raw": raw, "label": label, "actual": actual, "ok": ok})
+    return rows
 
 # ── Excel Output ─────────────────────────────────────────────────────────────
 
@@ -575,6 +775,15 @@ BASE_COL_WIDTHS = [9, 13, 16, 18, 12, 22, 18, 11, 13]
 
 def bdr():
     return Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+def neutralize_formula_cells(ws, row_idx, num_cols):
+    """アーティスト名等が =LOVE のように =+-@ で始まると、Excel/openpyxlが
+    数式と誤解釈して値が消えることがある。該当セルは明示的に文字列型にする。"""
+    for col in range(1, num_cols + 1):
+        cell = ws.cell(row_idx, col)
+        v = cell.value
+        if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+            cell.data_type = "s"
 
 def fmt_time(dt): return dt.strftime("%H:%M:%S")
 
@@ -645,6 +854,7 @@ def write_setlist(ws, schedule, df, durations, remarks):
                fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells + [remark_text]
         ws.append(row)
         ri = ws.max_row
+        neutralize_formula_cells(ws, ri, len(headers))
         if name in warn_teams: fill = WARN_FILL
         elif name in note_teams: fill = NOTE_FILL
         else: fill = ALT_FILL if team_num % 2 == 0 else None
@@ -711,6 +921,30 @@ def write_similarity_check(ws, ordered, song_pairs, artist_pairs):
     for i in range(1, len(hdrs)+1):
         ws.column_dimensions[get_column_letter(i)].width = 18
 
+def write_pref_check(ws, rows):
+    hdrs = ["チーム名", "希望時間帯（原文）", "解釈した制約", "実際の結果", "判定"]
+    ws.append(hdrs)
+    for col in range(1, len(hdrs) + 1):
+        c = ws.cell(1, col)
+        c.fill = HDR_FILL; c.font = HDR_FONT
+        c.alignment = Alignment(horizontal="center"); c.border = bdr()
+    for row in rows:
+        ok = row["ok"]
+        judge = "OK" if ok else "要確認"
+        values = [row["name"], row["raw"], row["label"], row["actual"], judge]
+        ws.append(values)
+        ri = ws.max_row
+        neutralize_formula_cells(ws, ri, len(hdrs))
+        for col in range(1, len(hdrs) + 1):
+            c = ws.cell(ri, col)
+            if not ok: c.fill = WARN_FILL
+            c.font = Font(name="Arial", size=10)
+            c.alignment = Alignment(horizontal="left" if col in (1, 2, 3, 4) else "center", vertical="center")
+            c.border = bdr()
+    widths = [18, 30, 20, 18, 10]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -732,6 +966,26 @@ def main():
                    help="出演順タイブレークをランダム化する乱数シード。同じ入力に対し--seedを変えて"
                         "複数回実行し、末尾に出力される QUALITY_SUMMARY を比較することで、"
                         "貪欲法が局所最適に陥った場合の代替案を探索できる。省略時は従来通り決定的。")
+    p.add_argument("--time-limit-sec", type=int, default=60,
+                   help="CP-SATの1回あたり探索時間(秒)。デフォルト60。70チーム超では"
+                        "120〜270秒程度確保することを推奨（短いと明らかに悪い解になりやすい）。")
+    p.add_argument("--hard-pref", action="store_true",
+                   help="希望時間帯(first/second/before/after/block)をハード制約として先に解を試み、"
+                        "実行不可能な場合のみ自動でソフト制約にフォールバックする。"
+                        "early/lateは連続的な希望のためハード化されない。")
+    p.add_argument("--hard-min-shared-gap", action="store_true",
+                   help="掛け持ち間隔の最低ライン(40分)をハード制約にする。"
+                        "実行不可能な場合は自動フォールバックせずCP-SATが解なしを返し、"
+                        "貪欲法にフォールバックする（このオプションを外して再実行することを検討）。")
+    p.add_argument("--hard-similarity", action="store_true",
+                   help="曲・アーティストの最低間隔(2組)をハード制約にする。挙動は--hard-min-shared-gapと同様。")
+    p.add_argument("--shared-ideal-off", action="store_true",
+                   help="掛け持ち間隔の「1時間が理想」という上乗せの目的関数項を無効化し、"
+                        "40分死守（--hard-min-shared-gap併用時）または40分への到達のみを目的にする。")
+    p.add_argument("--fixed-order-file", default="",
+                   help="事前に決定済みの出演順(チーム名のJSON配列)を書いたファイルパス。"
+                        "指定時は最適化をスキップし、そのままレポート生成のみ行う"
+                        "（手動・局所探索で作った解をExcel化する用途）。")
     args = p.parse_args()
     if args.seed is not None:
         random.seed(args.seed)
@@ -751,6 +1005,18 @@ def main():
     teams = df.to_dict("records")
 
     overrides = json.loads(args.duration_overrides) if args.duration_overrides else {}
+    for name, val in overrides.items():
+        try:
+            v = int(val)
+        except (TypeError, ValueError):
+            continue
+        if v > 1200:
+            # ダンス出演時間として20分超は非現実的 → Spotifyのduration_ms(ミリ秒)を
+            # そのまま渡してしまっている(1000で割り忘れ)可能性が高い。
+            sys.stderr.write(
+                "WARNING: {} の再生時間 {} 秒は異常に長い可能性があります。"
+                "Spotify等から取得した duration_ms（ミリ秒）をそのまま渡していないか確認してください"
+                "（1000で割って秒に変換する必要があります）。\n".format(name, v))
     client_id, client_secret = load_spotify_credentials()
     durations = {}; missing = []
 
@@ -783,10 +1049,27 @@ def main():
     pref_overrides = json.loads(args.pref_overrides) if args.pref_overrides else {}
     n_blocks = args.n_blocks if args.n_blocks > 0 else (5 if len(teams) > 15 else 4)
     start_dt = datetime.strptime(args.start_time, "%H:%M")
-    ordered = greedy_schedule(teams, durations, conflicts, n_blocks=n_blocks, break_sec=MIN_BREAK_MINUTES * 60,
-                               song_pairs=song_pairs, artist_pairs=artist_pairs,
-                               pref_overrides=pref_overrides, start_dt=start_dt,
-                               randomize=(args.seed is not None))
+
+    if args.fixed_order_file:
+        with open(args.fixed_order_file, encoding="utf-8") as f:
+            ordered = json.load(f)
+        team_names = {t["name"] for t in teams}
+        fixed_names = set(ordered)
+        if fixed_names != team_names:
+            missing_names = team_names - fixed_names
+            extra_names = fixed_names - team_names
+            sys.exit("[ERROR] --fixed-order-file の出演順が入力チーム一覧と一致しません。"
+                      "不足: {} / 余分: {}".format(sorted(missing_names), sorted(extra_names)))
+    else:
+        ordered = greedy_schedule(teams, durations, conflicts, n_blocks=n_blocks, break_sec=MIN_BREAK_MINUTES * 60,
+                                   song_pairs=song_pairs, artist_pairs=artist_pairs,
+                                   pref_overrides=pref_overrides, start_dt=start_dt,
+                                   randomize=(args.seed is not None),
+                                   time_limit_sec=args.time_limit_sec,
+                                   hard_min_shared_gap=args.hard_min_shared_gap,
+                                   hard_similarity=args.hard_similarity,
+                                   hard_pref=args.hard_pref,
+                                   shared_ideal_off=args.shared_ideal_off)
     blocks = assign_blocks(ordered, n_blocks)
     schedule = calc_schedule(blocks, durations, args.start_time)
     violations = check_violations(ordered, durations, conflicts, schedule=schedule)
@@ -796,7 +1079,8 @@ def main():
     prefs = {t["name"]: normalize_pref(pref_overrides.get(t["name"]), t.get("preferred_time")) for t in teams}
     raw_pref_text = {t["name"]: t.get("preferred_time") for t in teams}
     remarks = build_remarks(ordered, prefs, violations, shared_notes, song_violations, artist_violations,
-                             schedule=schedule, raw_pref_text=raw_pref_text)
+                             schedule=schedule, raw_pref_text=raw_pref_text, n_blocks=n_blocks)
+    pref_checks = build_pref_checks(ordered, prefs, raw_pref_text, schedule, n_blocks)
 
     wb = Workbook()
     ws1 = wb.active; ws1.title = "セットリスト"
@@ -807,6 +1091,9 @@ def main():
     if song_pairs or artist_pairs:
         ws3 = wb.create_sheet("曲・アーティスト重複チェック")
         write_similarity_check(ws3, ordered, song_pairs, artist_pairs)
+    if pref_checks:
+        ws4 = wb.create_sheet("希望時間帯チェック")
+        write_pref_check(ws4, pref_checks)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.output)
 
