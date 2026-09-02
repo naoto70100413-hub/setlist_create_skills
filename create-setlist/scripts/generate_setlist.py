@@ -141,7 +141,7 @@ def elapsed_gap(ordered, a, b, durations, boundaries=(), break_sec=0):
     if ia > ib: ia, ib = ib, ia
     gap = sum(durations.get(ordered[i], 0) + 30 for i in range(ia, ib))
     # a-b の間にブロックの休憩が挟まる場合、その分の時間も間隔に加算する
-    # （休憩は最低10分は確保される前提で見積もる）
+    # （休憩は最低13分は確保される前提で見積もる）
     crossed = sum(1 for p in boundaries if ia < p <= ib)
     return gap + crossed * break_sec
 
@@ -427,14 +427,14 @@ def assign_blocks(ordered, n_blocks):
         idx += size
     return blocks
 
-def round_up_15(dt):
-    """次の15分刻み (00/15/30/45分) に切り上げる。"""
+def round_up_5(dt):
+    """次の5分刻み (00/05/10/.../55分) に切り上げる。"""
     if dt.second > 0:
         dt = dt.replace(second=0) + timedelta(minutes=1)
-    rem = dt.minute % 15
-    return dt if rem == 0 else dt + timedelta(minutes=(15 - rem))
+    rem = dt.minute % 5
+    return dt if rem == 0 else dt + timedelta(minutes=(5 - rem))
 
-MIN_BREAK_MINUTES = 10
+MIN_BREAK_MINUTES = 13
 
 def calc_schedule(blocks, durations, start_time_str):
     current = datetime.strptime(start_time_str, "%H:%M")
@@ -442,8 +442,9 @@ def calc_schedule(blocks, durations, start_time_str):
     for block_idx, block in enumerate(blocks):
         if block_idx > 0:
             break_start = current
-            # 休憩は最低10分確保しつつ、次ブロックの開始は00/15/30/45分に切り上げる
-            break_end = round_up_15(break_start + timedelta(minutes=MIN_BREAK_MINUTES))
+            # 休憩は最低13分確保しつつ、次ブロックの開始は5分刻みに切り上げる
+            # （切り上げ幅は最大4分のため、実際の休憩時間は13〜17分に収まる）
+            break_end = round_up_5(break_start + timedelta(minutes=MIN_BREAK_MINUTES))
             schedule.append({"type":"break","block":block_idx+1,
                 "start":break_start,"end":break_end,
                 "duration_sec":int((break_end-break_start).total_seconds())})
