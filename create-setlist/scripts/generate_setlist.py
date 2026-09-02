@@ -127,6 +127,8 @@ def compute_block_boundaries(n, n_blocks):
         boundaries.append(idx)
     return boundaries
 
+TEAM_INTERVAL_SEC = 30   # チーム間の入りはけ時間
+
 # 優先度順: 1. 掛け持ち間隔 > 2. 曲・アーティストの連続回避 > 3. 希望時間帯
 IDEAL_SHARED_GAP_SEC = 3600   # 基本目標: 1時間
 MIN_SHARED_GAP_SEC   = 2400   # 最低ライン: 40分
@@ -139,7 +141,7 @@ PREF_DEADLINE_DECAY_SEC = 3600   # 指定時刻(before/after)を外れた場合�
 def elapsed_gap(ordered, a, b, durations, boundaries=(), break_sec=0):
     ia, ib = ordered.index(a), ordered.index(b)
     if ia > ib: ia, ib = ib, ia
-    gap = sum(durations.get(ordered[i], 0) + 30 for i in range(ia, ib))
+    gap = sum(durations.get(ordered[i], 0) + TEAM_INTERVAL_SEC for i in range(ia, ib))
     # a-b の間にブロックの休憩が挟まる場合、その分の時間も間隔に加算する
     # （休憩は最低13分は確保される前提で見積もる）
     crossed = sum(1 for p in boundaries if ia < p <= ib)
@@ -149,7 +151,7 @@ def estimate_start_dt(order, i, durations, boundaries, break_sec, start_dt):
     """出演順 order の position i にいるチームの、開始時刻の見積もりを返す。"""
     if start_dt is None:
         return None
-    cum = sum(durations.get(order[j], 0) + 30 for j in range(i))
+    cum = sum(durations.get(order[j], 0) + TEAM_INTERVAL_SEC for j in range(i))
     cum += break_sec * sum(1 for p in boundaries if p <= i)
     return start_dt + timedelta(seconds=cum)
 
@@ -282,12 +284,12 @@ def _cpsat_solve(teams, durations, conflicts, n_blocks, break_sec,
     for r in range(n):
         model.AddElement(team_at_rank[r], dur_list, dur_at_rank[r])
 
-    horizon = sum(dur_list) + 30 * n + break_sec * len(boundaries) + 10
+    horizon = sum(dur_list) + TEAM_INTERVAL_SEC * n + break_sec * len(boundaries) + 10
     start_at_rank = [model.NewIntVar(0, horizon, "sar_{}".format(r)) for r in range(n)]
     model.Add(start_at_rank[0] == 0)
     for r in range(1, n):
         extra = break_sec if r in boundaries else 0
-        model.Add(start_at_rank[r] == start_at_rank[r - 1] + dur_at_rank[r - 1] + 30 + extra)
+        model.Add(start_at_rank[r] == start_at_rank[r - 1] + dur_at_rank[r - 1] + TEAM_INTERVAL_SEC + extra)
 
     start_of_team = [model.NewIntVar(0, horizon, "sot_{}".format(i)) for i in range(n)]
     for i in range(n):
@@ -436,6 +438,12 @@ def round_up_5(dt):
 
 MIN_BREAK_MINUTES = 13
 
+def next_team_start(prev_start, prev_duration_sec, interval_sec=TEAM_INTERVAL_SEC):
+    """次チームの出演開始時刻 = 前チームの開始時刻 + 出演時間 + 入りはけ時間。
+    各ブロックの先頭チームの開始時刻はブロック休憩側（round_up_5）で決まるため、
+    この関数はブロック内の2番目以降のチームにのみ使う。"""
+    return prev_start + timedelta(seconds=prev_duration_sec + interval_sec)
+
 def calc_schedule(blocks, durations, start_time_str):
     current = datetime.strptime(start_time_str, "%H:%M")
     schedule = []
@@ -454,7 +462,7 @@ def calc_schedule(blocks, durations, start_time_str):
             end = current + timedelta(seconds=dur)
             schedule.append({"type":"team","block":block_idx+1,"name":name,
                 "start":current,"end":end,"duration_sec":dur})
-            current = end + timedelta(seconds=30)
+            current = next_team_start(current, dur)
     return schedule
 
 def real_gap(schedule, a, b):
@@ -643,7 +651,7 @@ def write_setlist(ws, schedule, df, durations, remarks):
         remark_text = "; ".join(text for text, _ in remarks.get(name, []))
         row = [team_num, block_label, fmt_time(entry["start"]),
                name, info.get("entry_id",""), info.get("song",""), info.get("artist",""),
-               fmt_dur(entry["duration_sec"]), "0:30"] + shared_cells + [remark_text]
+               fmt_dur(entry["duration_sec"]), fmt_dur(TEAM_INTERVAL_SEC)] + shared_cells + [remark_text]
         ws.append(row)
         ri = ws.max_row
         if name in warn_teams: fill = WARN_FILL
